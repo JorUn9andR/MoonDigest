@@ -168,10 +168,12 @@
 
   // The running-state pill's inside: text, a bar when done/total is known, and one button (btn = { attrs, label, reason };
   // a reason disables it).
-  function activityHtml({ text, done = 0, total = 0, btn = null, stuck = false }) {
+  // text ends in 「 · ‹wait›」 when wait is given; a narrow window cuts the text before it, never the countdown.
+  function activityHtml({ text, done = 0, total = 0, btn = null, stuck = false, wait = "" }) {
+    const head = wait && text.endsWith(` · ${wait}`) ? text.slice(0, -wait.length - 3) : text;
     const bar = total ? `<span class="activity-bar" aria-hidden="true"><i style="width:${Math.round((done / total) * 100)}%"></i></span>` : "";
     const b = btn ? `<button type="button" ${btn.attrs} aria-label="${esc(btn.label)}"${reasonAttrs(btn.reason)}>${esc(btn.label)}</button>` : "";
-    return `${stuck ? `<span class="activity-stuck">${ICON.alert}</span>` : ""}<span class="activity-text">${esc(text)}</span>${bar}${b}`;
+    return `${stuck ? `<span class="activity-stuck">${ICON.alert}</span>` : ""}<span class="activity-text">${esc(head)}</span>${head === text ? "" : `<span>· ${esc(wait)}</span>`}${bar}${b}`;
   }
   // Draws the pill from state ({ text, done, total, btn, stuck, slowed, finished }); null / false hides it. Blue while
   // running; stuck (B站限流 or offline, waiting to retry) is amber with a red ⚠; slowed (going on slower after B站限流)
@@ -181,18 +183,13 @@
     if (!a) return;
     el.classList.toggle("warn", Boolean(a.stuck || a.slowed));
     el.classList.toggle("done", Boolean(a.finished));
+    el.title = a.text; // the whole line on hover, for a narrow window that cuts it
     el.innerHTML = activityHtml(a);
   }
   // 「B站限流卡住，01:30 后重试」 while sec > 0, else "".
   const waitText = (why, sec) => (sec > 0 ? `${why}，${fmtDuration(sec)} 后重试` : "");
   // 关注's wait on B站限流: follow-bg.js's queue pause, and the page's wait before a write or a 视频投稿 page goes again.
   const BILI_HOLD_MS = 90000;
-  // A running ✦ AI 打标签's pill, from the run state runAiBatches keeps ({ done, total }): 第 N/M 批, or wait (the AI
-  // 429 countdown, MoonTriage.waitOf), amber. where names another folder's run.
-  function aiActivity(a, wait = "", where = "") {
-    if (wait) return { text: `AI 打标签 · ${wait}${where}`, stuck: true };
-    return a.total ? { text: `AI 打标签 第 ${a.done + 1}/${a.total} 批${where}`, done: a.done, total: a.total } : { text: `AI 打标签运行中${where}` };
-  }
 
   // Row 1's 「已刷新 +N −M」 pill and the notice it opens below it. Ids are prefix + ViewBtn / Notice / Text / Detail /
   // CloseBtn; each mode passes those elements as { pill, notice, text, detail, close }.
@@ -592,5 +589,6 @@
     main.addEventListener("focusin", (e) => e.target.closest(HEAD_ROWS) && set(headroomStep(s, { focus: true })));
   }
 
-  globalThis.TriageUi = { esc, pad, dayText, fmtDate, fmtAgo, agoHtml, setSearchScope, confirmList, pickTitle, fmtDuration, fmtCount, cleanTagName, plainClick, cardPlayClick, cardPickClick, pickCard, img, toCsv, cardTagChip, syncedText, headMeta, titleHtml, ICON, AI_SPARK, byValue, dirWords, sortControl, filterBtn, labeledRow, stateGroup, aiRecentChip, searchBox, bindSearch, resultCount, rowButtons, menuItem, BACKUP_ITEM, reasonAttrs, setReason, WARN_DOT, selectAllState, selectAllBox, toggleAll, setActivity, waitText, BILI_HOLD_MS, aiActivity, syncPill, setSync, bindSync, tagButtons, sideFoot, selbar, askTransfer, sideItem, emptyState, refreshEmpty, noMatch, fillSetRows, clampNumber, clampNumbers, mergeAiBatch, aiChanges, aiProposalOk, previewId, aiTally, nextTagColor, tagNameError, deleteTagAsk, editedTag, withoutTag, undoAsk, tagRowHtml, sp, AI_RECENT_RULES, aiRecentUndo, tagPlusBtn, viewerLine, viewerKeyFrom, headroomStep, headroom };
+  globalThis.TriageUi = { esc, pad, dayText, fmtDate, fmtAgo, agoHtml, setSearchScope, confirmList, pickTitle, fmtDuration, fmtCount, cleanTagName, plainClick, cardPlayClick, cardPickClick, pickCard, img, toCsv, cardTagChip, syncedText, headMeta, titleHtml, ICON, AI_SPARK, byValue, dirWords, sortControl, filterBtn, labeledRow, stateGroup, aiRecentChip, searchBox, bindSearch, resultCount, rowButtons, menuItem, BACKUP_ITEM, reasonAttrs, setReason, WARN_DOT, selectAllState, selectAllBox, toggleAll, setActivity, waitText, BILI_HOLD_MS, syncPill
+, setSync, bindSync, tagButtons, sideFoot, selbar, askTransfer, sideItem, emptyState, refreshEmpty, noMatch, fillSetRows, clampNumber, clampNumbers, mergeAiBatch, aiChanges, aiProposalOk, previewId, aiTally, nextTagColor, tagNameError, deleteTagAsk, editedTag, withoutTag, undoAsk, tagRowHtml, sp, AI_RECENT_RULES, aiRecentUndo, tagPlusBtn, viewerLine, viewerKeyFrom, headroomStep, headroom };
 })();

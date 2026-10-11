@@ -497,21 +497,21 @@ for (const [file, fns] of [["triage.js", ["mergeAiBatch", "aiChanges"]], ["follo
   close("move", "7");
   assert.deepStrictEqual(plain(await p), { how: "move", target: { id: "7" } });
   assert.strictEqual(nodes.transferTarget.L.change.length, 1, "bound once");
-  // ✦ AI 打标签's pill: 第 N/M 批 with a bar; the AI 429 wait is amber with its countdown and no bar.
-  {
-    const a = { done: 1, total: 4 };
-    assert.deepStrictEqual(plain(UI.aiActivity(a)), { text: "AI 打标签 第 2/4 批", done: 1, total: 4 });
-    const w = plain(UI.aiActivity(a, UI.waitText("AI 平台限流卡住", 60), "（稍后）"));
-    assert.ok(w.stuck && !w.total && w.text === "AI 打标签 · AI 平台限流卡住，1:00 后重试（稍后）", w.text);
-    assert.strictEqual(UI.aiActivity(a, UI.waitText("x", 0)).stuck, undefined, "a past wait is over");
-    assert.strictEqual(UI.aiActivity({}).text, "AI 打标签运行中", "before the first batch");
-  }
+
   for (const bad of XSS) {
     assertInert(UI.titleHtml(bad, 2), "titleHtml");
     assertInert(UI.cardTagChip({ id: bad, name: bad, color: "#fff" }, bad), "cardTagChip");
     assertInert(UI.tagRowHtml({ id: bad, name: bad, color: "#fff", rule: bad }, { count: 1, who: "视频" }), "tagRowHtml");
     assertInert(UI.tagPlusBtn('data-x="1"', `给 ${bad} 打 UP 标签`), "tagPlusBtn");
     assertInert(UI.sideItem({ attrs: "", label: bad }), "sideItem");
+  }
+  {
+    // A stuck pill: the countdown sits apart from the line (a narrow window cuts the line only), the whole text on hover.
+    const el = { classList: { toggle() {} } };
+    const text = "加载收藏夹 1/3（电影） · B站限流卡住，1:29 后重试";
+    UI.setActivity(el, { text, wait: "B站限流卡住，1:29 后重试", stuck: true, done: 1, total: 3 });
+    assert.strictEqual(el.title, text);
+    assert.ok(el.innerHTML.includes('<span class="activity-text">加载收藏夹 1/3（电影）</span><span>· B站限流卡住，1:29 后重试</span>'), el.innerHTML);
   }
   console.log("shared selftest: all passed");
 })().catch((e) => {

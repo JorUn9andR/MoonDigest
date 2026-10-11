@@ -1802,6 +1802,20 @@ const unfavOnlyOf = (d) => Object.fromEntries(Object.entries(d).filter(([, v]) =
   store.triage_snapshot_8 = { bvids: ["BV3"], items: [item(3)] };
   await t.retireUnchosenFolders();
   assert.ok(store.triage_snapshot_8, "an empty folder list never retires anything");
+  // A full storage: 保存失败 is shown, nothing rejects, and a list whose videos could not be recorded is kept.
+  {
+    const realSet = ctx.chrome.storage.local.set;
+    ctx.chrome.storage.local.set = async () => { throw new Error("QUOTA_BYTES quota exceeded"); };
+    t.S.folders = t.S.allFolders = [{ id: 1 }];
+    t.S.removedCount = 0;
+    await t.retireUnchosenFolders();
+    assert.ok(store.triage_snapshot_8 && !store[t.K.removed]?.BV3, "retire: the old list stays");
+    assert.ok(toasts.at(-1).startsWith("保存失败"), toasts.at(-1));
+    await t.saveSnapshot("1", []);
+    assert.strictEqual(t.S.removedCount, 0, "saveSnapshot: the count follows what was saved");
+    ctx.chrome.storage.local.set = realSet;
+    delete store.triage_snapshot_8;
+  }
 
   // An unticked folder is retired like a deleted one, on the reload after the settings save; zero chosen retires nothing.
   for (const k of Object.keys(store)) delete store[k];
@@ -1829,6 +1843,17 @@ const unfavOnlyOf = (d) => Object.fromEntries(Object.entries(d).filter(([, v]) =
     assert.ok(store.triage_snapshot_toview && store.triage_decisions_toview, "稍后再看 kept");
     assert.deepStrictEqual(plain(store[t.K.removed]), removedBefore, "nothing moved to 已出分拣范围");
     assert.deepStrictEqual([t.el.banner.hidden, t.el.banner.dataset.kind, t.el.bannerText.textContent], [false, "toview", "稍后再看这次没读到，点「重试」再读一次"], "the user is told and offered 重试");
+    // The unread 稍后再看 still counts as a chosen folder everywhere: BV5 leaving folder 2 stays in it, not 已出分拣范围.
+    const snap2 = store.triage_snapshot_2;
+    store.triage_snapshot_2 = { bvids: ["BV2", "BV5"], items: [item(2), item(5)] };
+    await t.saveSnapshot("2", [item(2)]);
+    assert.deepStrictEqual(plain(store[t.K.removed]), removedBefore, "saveSnapshot: BV5 is still in 稍后再看");
+    assert.ok(store[t.K.left].BV5?.["2"], "BV5 only gets folder 2 on its trail");
+    await t.addMovedToRemoved("2", [item(5)], "T");
+    assert.deepStrictEqual(plain(store[t.K.removed]), removedBefore, "移动: BV5 is still in 稍后再看");
+    assert.strictEqual((await t.localItems("2")).get("BV5")?.from, "toview", "localItems finds BV5 in 稍后再看");
+    store.triage_snapshot_2 = snap2;
+    delete store[t.K.left].BV5;
     handlers["triage-folders"] = () => ({ ok: true, data: { folders: [{ id: 2, count: 2 }] } });
     store.triage_included_folders = ["2"];
     await t.loadFolders();

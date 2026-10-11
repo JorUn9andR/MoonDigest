@@ -443,6 +443,18 @@ const unfavOnlyOf = (d) => Object.fromEntries(Object.entries(d).filter(([, v]) =
     assert.deepStrictEqual(plain(Object.keys(t.S.kept).filter((b) => b.startsWith("BV6"))), ["BV61", "BV62"]);
     await t.undo();
     assert.ok(!t.S.kept.BV61 && !t.S.kept.BV62);
+    // U cut short by a failure: still in 所有收藏夹, the rest is the next U; after another folder opened, the rest stays
+    // in each folder's 最近取消收藏 and the open folder gets no step.
+    for (const away of [false, true]) {
+      const again = [{ ...item(63), folders: ["W1"] }, { ...item(64), folders: ["W2"] }];
+      openFake("all", again);
+      handlers["triage-unfav"] = () => ({ ok: true });
+      await t.fav.unfavMany(again);
+      handlers["triage-refav"] = (m) => (m.aid === 1064 ? { ok: false, error: "网络错误" } : (away && openFake("E", []), { ok: true }));
+      await t.undo();
+      const want = away ? ["「所有收藏夹」撤销中断（剩余 1 个在各收藏夹的最近取消收藏里）：网络错误", 0] : ["撤销中断（剩余 1 个可再按 U 重试）：网络错误", 1];
+      assert.deepStrictEqual([toasts.at(-1), t.S.undo.length], want, away ? "elsewhere: told only" : "here: U again");
+    }
     t.askConfirm = savedAsk;
     t.el.confirmBody = savedBody;
     t.S.selected.clear();
@@ -1107,6 +1119,7 @@ const unfavOnlyOf = (d) => Object.fromEntries(Object.entries(d).filter(([, v]) =
     const play = (b) => ((t.S.viewing = b), (t.S.viewer = t.viewerOf(b)), t.renderViewerTags());
     play("BV710");
     assert.ok(!t.el.viewerTags.hidden && t.el.viewerTags.innerHTML.includes("data-vtag>p0</span>") && t.el.viewerTags.innerHTML.includes('class="quiet tag-plus" data-vtag'));
+    assert.ok(t.el.viewerTags.innerHTML.includes('data-vtag aria-label="打视频标签"'), "the button says what it does, as the picker's title (给「…」打视频标签)");
     // It is named 「视频标签」, and T (which tags the playing video in 收藏夹) shows on its 「+ 标签」.
     assert.ok(t.el.viewerTags.innerHTML.startsWith('<span class="row-label">视频标签</span>') && t.el.viewerTags.innerHTML.includes('<kbd class="k-faint" aria-hidden="true">T</kbd>'));
     po = null;
@@ -2753,6 +2766,53 @@ const unfavOnlyOf = (d) => Object.fromEntries(Object.entries(d).filter(([, v]) =
       show("BV2");
       assert.strictEqual(t.S.viewing, "", "closed: ignored");
       Object.assign(t.el, realEl);
+    }
+    // 停止 on a 收藏夹 batch write's pill (as 关注's): pressed, it says 停止中 (disabled, with why) until the request in
+    // flight lands; what went through stays, recorded and undoable. A batch undo stopped the same way keeps the rest for U.
+    {
+      const vids = [1, 2, 3, 4].map((n) => item(90 + n));
+      const stopAt = (type, aid) => {
+        const h = { inFlight: false, release: null };
+        handlers[type] = (m) => ((m.aid ?? m.aids[0]) === aid ? ((h.inFlight = true), new Promise((r) => (h.release = () => r({ ok: true })))) : { ok: true });
+        return h;
+      };
+      const pressStop = async (h) => {
+        for (let i = 0; i < 500 && !h.inFlight; i++) await new Promise((r) => setTimeout(r, 2));
+        assert.deepStrictEqual([t.activityState().act, t.activityState().actLabel], ["fav", "停止"]);
+        fire("activity", "click", { target: { closest: (sel) => (sel === "[data-head]" ? { dataset: { head: "fav" } } : null) } });
+        assert.deepStrictEqual([t.activityState().actLabel, t.activityState().stopping], ["停止中", true]);
+        t.renderStatus();
+        assert.ok(t.el.activity.innerHTML.includes('aria-label="停止中" disabled title="当前这一批做完就停止"'), t.el.activity.innerHTML);
+        h.release();
+      };
+      openFake("toview", vids);
+      const unfavs = stopAt("triage-unfav", 1092);
+      const running = t.fav.unfavMany(vids);
+      await pressStop(unfavs);
+      await running;
+      assert.deepStrictEqual([Object.keys(store[t.K.decisions("toview")]), toasts.at(-1)], [["BV91", "BV92"], "已停止批量取消收藏：完成 2 个，未完成 2 个 · U 撤销已完成的"]);
+      const refavs = stopAt("triage-refav", 1091);
+      const undoing = t.undo();
+      await pressStop(refavs);
+      await undoing;
+      assert.deepStrictEqual([Object.keys(store[t.K.decisions("toview")]), toasts.at(-1), t.S.undo.length], [["BV92"], "已停止撤销（已重新收藏 1 个，剩余 1 个可再按 U 撤销）", 1]);
+      await t.undo();
+      assert.deepStrictEqual([store[t.K.decisions("toview")], toasts.at(-1)], [{}, "已重新收藏 1 个"]);
+      // 移动 / 复制 stopped: the ones copied stay, and it says how far it got.
+      const saved = { allFolders: t.S.allFolders, folders: t.S.folders, included: t.S.included, ask: t.askTransfer };
+      t.S.allFolders = t.S.folders = [{ id: "toview", title: "稍后再看" }, { id: "T", title: "目标" }];
+      t.S.included = ["toview", "T"];
+      t.askTransfer = async () => ({ how: "copy", target: { id: "T" } });
+      const copies = stopAt("triage-transfer", 1093);
+      const copying = t.fav.transfer(vids);
+      await pressStop(copies);
+      await copying;
+      assert.strictEqual(toasts.at(-1), "已停止复制到「目标」：完成 3 个，未完成 1 个");
+      Object.assign(t.S, { allFolders: saved.allFolders, folders: saved.folders, included: saved.included });
+      t.askTransfer = saved.ask;
+      handlers["triage-unfav"] = handlers["triage-refav"] = handlers["triage-transfer"] = () => ({ ok: true });
+      await new Promise((r) => setTimeout(r, 60));
+      openFake("A", [item(1)]);
     }
     const doc = (type) => docL[type].forEach((f) => f({}));
     const wait = () => new Promise((r) => setTimeout(r, 20));

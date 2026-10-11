@@ -20,9 +20,13 @@
   // Error code → what the page shows. action: "settings" (去设置), "login" (去登录); any other code is "none".
   // text replaces the background's words for the code. Numbers are B站's own codes, passed through.
   const CODES = Object.freeze({
+    // The AI platform errors after which every request fails alike: 分拣台 stops its run on them, and both it and the
+    // side panel offer 去设置 (an unreachable platform or a timeout may be a wrong base URL or model).
     AI_AUTH: { action: "settings" },
     AI_QUOTA: { action: "settings" },
     AI_SETUP: { action: "settings" },
+    AI_NETWORK: { action: "settings" },
+    AI_TIMEOUT: { action: "settings" },
     // Obsidian itself is unusable (not set up, off, wrong key): every write fails alike and the fix is in the settings
     // page. OBSIDIAN_DOWN (closed, plugin off, timeout) also fails every write, but the settings page cannot fix it.
     OBSIDIAN: { action: "settings" },
@@ -40,8 +44,8 @@
     return CODES[resp?.code]?.text || own || fallback;
   }
 
-  // The reply as an Error to throw; error.action says which button the catch shows.
-  const fromResp = (resp, fallback) => Object.assign(new Error(text(resp, fallback)), { action: action(resp?.code) });
+  // The reply as an Error to throw; error.action says which button the catch shows, error.cause is the reply.
+  const fromResp = (resp, fallback) => Object.assign(new Error(text(resp, fallback), { cause: resp }), { action: action(resp?.code) });
 
   // The background's "未授权访问 <origin>，授权后重试" (hostPermissionError): an upgraded install lacks the AI provider's
   // origin. request() must run in a click handler: permissions.request needs the user gesture, the worker cannot ask.

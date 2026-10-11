@@ -8,7 +8,7 @@ const assert = require("assert");
 const source = fs.readFileSync(path.join(__dirname, "sidepanel.js"), "utf8").replace(/^init\(\)\.catch\(/m, "(async () => {})().catch(");
 assert.ok(source.includes("(async () => {})().catch("), "harness strips the page entry point");
 
-const stubEl = () => new Proxy({ classList: { toggle() {}, add() {}, remove() {} }, style: {}, dataset: {} }, {
+const stubEl = () => new Proxy({ classList: { toggle() {}, add() {}, remove() {}, contains: () => false }, style: {}, dataset: {}, querySelectorAll: () => [], querySelector: () => null }, {
   get: (o, k) => (k in o ? o[k] : () => {}),
   set: (o, k, v) => ((o[k] = v), true)
 });
@@ -20,8 +20,8 @@ const ctx = vm.createContext({
   URL,
   setTimeout: (f) => setImmediate(f),
   clearTimeout: (id) => clearImmediate(id),
-  document: { getElementById: stubEl, querySelector: () => null, querySelectorAll: () => [], addEventListener() {}, createElement: stubEl },
-  window: { addEventListener() {}, setTimeout: (f) => setImmediate(f), clearTimeout: (id) => clearImmediate(id), matchMedia: () => ({ matches: false }) },
+  document: { body: stubEl(), getElementById: stubEl, querySelector: () => null, querySelectorAll: () => [], addEventListener() {}, createElement: stubEl },
+  window: { addEventListener() {}, setTimeout: (f) => setImmediate(f), clearTimeout: (id) => clearImmediate(id), matchMedia: () => ({ matches: false }), cancelAnimationFrame() {} },
   navigator: {},
   chrome: {
     runtime: {
@@ -48,6 +48,8 @@ vm.runInContext(
   ctx
 );
 const realRenderHistoryList = ctx.renderHistoryList;
+// The page's own functions, for the behaviour tests below that need them past the stubs.
+const real = Object.fromEntries(["restartChat", "renderSuggestions", "fillPrompt", "applyConversation", "startNewConversation", "hydratePinnedConversationContext"].map((f) => [f, ctx[f]]));
 // Untrusted text (titles, UP names, comments, AI replies, tag names, paths) stays text: no tag of its own, no way out of
 // a quoted attribute.
 const XSS = ["<img src=x onerror=alert(1)>", `"'><script>alert(1)</script>`];
@@ -172,6 +174,42 @@ const page = (id) => ({ ok: true, payload: { url: `https://example.com/${id}`, t
     ctx.showObsidianFailure(E.fromResp({ ok: false, error: E.TEXT.obsidianDown, code: "OBSIDIAN_DOWN" }, "Local API 写入失败"));
     assert.deepStrictEqual(notices, [[`写入 Obsidian 失败：${E.TEXT.obsidianKey}`, true], ["写入 Obsidian 失败：Obsidian 返回 HTTP 500", true], [`写入 Obsidian 失败：${E.TEXT.obsidianDown}`, true]]);
     assert.strictEqual(settings, 1);
+
+    // The same write with the video page open: the page's failure shows once, with one prefix, and a write the page
+    // did not make for another reason (the video switched) is said as it is, not as a failure.
+    const saved = Object.fromEntries(["loadObsidianSettings", "syncVideoNoteAiSection", "sendMessageToActiveTab"].map((k) => [k, ctx[k]]));
+    const url = "https://www.youtube.com/watch?v=dQw4w9WgXcQ";
+    let reply;
+    Object.assign(ctx, {
+      loadObsidianSettings: async () => ({ settings: {}, baseUrl: "http://127.0.0.1:27123", apiKey: "k" }),
+      syncVideoNoteAiSection: async () => ({ exists: false, filepath: "p.md" }),
+      sendMessageToActiveTab: async () => reply,
+      yt: { url, site: "youtube", videoId: "dQw4w9WgXcQ", isVideoContext: true, title: "Y" }
+    });
+    activeTab = { id: 4, url };
+    vm.runInContext('contextData = yt; liveContextData = yt; liveTabUrl = yt.url; currentConversationMeta = null; chatHistory = [{ role: "user", content: "q" }, { role: "assistant", content: "a" }]', ctx);
+    notices.length = 0;
+    reply = { ok: false, error: E.TEXT.obsidianDown, code: "OBSIDIAN_DOWN", payload: { message: `写入 Obsidian 失败：${E.TEXT.obsidianDown}` } };
+    await ctx.saveCurrentConversationToObsidian();
+    reply = { ok: true, payload: { message: "视频已切换，未写入 Obsidian。" } };
+    await ctx.saveCurrentConversationToObsidian();
+    assert.deepStrictEqual(notices.filter(([text]) => !text.startsWith("正在")), [[`写入 Obsidian 失败：${E.TEXT.obsidianDown}`, true], ["视频已切换，未写入 Obsidian。", undefined]]);
+    assert.strictEqual(settings, 1, "a closed Obsidian does not open the settings page");
+
+    // A YouTube video (or a B站 P2+) without a note and with its page closed: no note can be built, so the
+    // conversation is written as its own note, as on 视频记录, linking the video note's path.
+    const realRuntimeSend = ctx.chrome.runtime.sendMessage;
+    const sent = [];
+    ctx.chrome.runtime.sendMessage = async (m) => (sent.push(m), { ok: true, exists: false });
+    vm.runInContext('liveTabUrl = "https://example.com/"', ctx);
+    notices.length = 0;
+    await ctx.saveCurrentConversationToObsidian();
+    const writes = sent.filter((m) => m.type === "write-obsidian-note");
+    assert.strictEqual(writes.length, 1, JSON.stringify(notices));
+    assert.ok(writes[0].content.includes("q") && writes[0].content.includes("a"), writes[0].content);
+    assert.strictEqual(notices.at(-1)[0], `已写入 Obsidian：${writes[0].filepath}（单独的对话笔记）`);
+    ctx.chrome.runtime.sendMessage = realRuntimeSend;
+    Object.assign(ctx, saved);
   }
 
   {
@@ -233,22 +271,140 @@ const page = (id) => ({ ok: true, payload: { url: `https://example.com/${id}`, t
   }
 
   {
-    // Following: a conversation with nothing asked follows any other video, also the first one after a web page
-    // or an empty 问 AI conversation; one with messages follows only from the video it belongs to.
+    // Following (decideFollow): a conversation with nothing asked follows any other video, also the first one after a
+    // web page or an empty 问 AI conversation; one with messages follows only from the video it belongs to.
     const v = (id) => `https://www.bilibili.com/video/${id}`;
-    ctx.web = page("home").payload;
-    const follows = (setup, from, to) => vm.runInContext(`${setup}; isFollowCandidate(${JSON.stringify(from)}, ${JSON.stringify(to)})`, ctx);
-    assert.strictEqual(follows("contextData = web; currentConversationMeta = null; chatHistory = []", "", v("BV1aa")), true, "first video after a web page");
-    assert.strictEqual(follows(`contextData = { url: "${v("BV1aa")}" }`, v("BV1aa"), v("BV1aa")), false, "the video already shown");
-    const pinned = `currentConversationMeta = { pinnedContext: true, contextUrl: "${v("BV1vv")}" }; chatHistory = []`;
-    assert.strictEqual(follows(pinned, v("BV1ee"), v("BV1ee")), true, "empty 问 AI conversation, back to the video tab");
-    const history = `currentConversationMeta = { pinnedContext: true, contextUrl: "${v("BV1hh")}" }; chatHistory = [{ role: "user", content: "q" }]`;
-    assert.strictEqual(follows(history, v("BV1ee"), v("BV1ff")), false, "an opened history conversation stays");
-    assert.strictEqual(follows(history, "", v("BV1ff")), false);
-    assert.strictEqual(follows(history, v("BV1hh"), v("BV1ff")), true, "the conversation of the video just played");
+    const web = page("home").payload.url;
+    const fresh = { shownUrl: web, hasMessages: false, bound: false, lastVideoUrl: "", hasContext: true };
+    const pinnedEmpty = { shownUrl: v("BV1vv"), hasMessages: false, bound: true, lastVideoUrl: v("BV1ee"), hasContext: true };
+    const history = { shownUrl: v("BV1hh"), hasMessages: true, bound: true, lastVideoUrl: v("BV1ee"), hasContext: true };
+    const at = (state, ev) => ({ ...ctx.decideFollow(state, { stage: "payload", follow: true, keyChanged: true, ...ev }) });
+    const table = [
+      ["first video after a web page", fresh, { toUrl: v("BV1aa") }, "follow", v("BV1aa")],
+      ["the video already shown", { ...fresh, shownUrl: v("BV1aa"), lastVideoUrl: v("BV1aa") }, { toUrl: v("BV1aa"), keyChanged: false }, "adopt", v("BV1aa")],
+      ["empty 问 AI conversation, back to the video tab", pinnedEmpty, { toUrl: v("BV1ee") }, "follow", v("BV1ee")],
+      ["an opened history conversation stays", history, { toUrl: v("BV1ff") }, "keep", v("BV1ff")],
+      ["no video played before", { ...history, lastVideoUrl: "" }, { toUrl: v("BV1ff") }, "keep", v("BV1ff")],
+      ["the conversation of the video just played", { ...history, lastVideoUrl: v("BV1hh") }, { toUrl: v("BV1ff") }, "follow", v("BV1ff")],
+      // U1: any load that finds an unbound conversation on another video follows, not only a tab event.
+      ["send, refresh or chip click on another video", { ...fresh, shownUrl: v("BV1aa") }, { toUrl: v("BV1bb"), follow: false }, "follow", v("BV1bb")],
+      ["a web page is adopted, not followed", { ...fresh, shownUrl: v("BV1aa") }, { toUrl: "", follow: false }, "adopt", ""],
+      // The panel's first load takes the tab without the AI 总结 fill.
+      ["first load", { ...fresh, shownUrl: "", hasContext: false }, { toUrl: v("BV1aa") }, "adopt", v("BV1aa")],
+      ["first load, not a tab event", { ...fresh, shownUrl: "", hasContext: false }, { toUrl: v("BV1aa"), follow: false }, "adopt", v("BV1aa")],
+      // A load that leaves a bound conversation in place does not move lastVideoUrl, so the follow load after it still
+      // sees the tab leave the video just played.
+      ["non-follow load does not advance", { ...history, lastVideoUrl: v("BV1hh") }, { toUrl: v("BV1ff"), follow: false }, "keep", v("BV1hh")]
+    ];
+    for (const [name, state, ev, action, last] of table) assert.deepStrictEqual(at(state, ev), { action, lastVideoUrl: last }, name);
+    // The tab stage acts on the tab URL alone, except a watch-later part (named by oid) and the first load.
+    const tab = (state, ev) => ({ ...ctx.decideFollow(state, { stage: "tab", follow: true, oid: false, ...ev }) });
+    assert.deepStrictEqual(tab(fresh, { toUrl: v("BV1aa") }), { action: "follow", lastVideoUrl: v("BV1aa") });
+    assert.deepStrictEqual(tab(fresh, { toUrl: v("BV1aa"), oid: true }), { action: "none", lastVideoUrl: "" }, "oid");
+    assert.deepStrictEqual(tab({ ...fresh, hasContext: false }, { toUrl: v("BV1aa") }), { action: "none", lastVideoUrl: "" }, "first load");
+    assert.deepStrictEqual(tab(fresh, { toUrl: v("BV1aa"), follow: false }), { action: "none", lastVideoUrl: "" }, "not a tab event");
 
-    // Showing another conversation drops a pending AI 总结 fill.
-    assert.strictEqual(vm.runInContext('summaryFillPending = true; applyConversation({ id: "h", messages: [] }); summaryFillPending', ctx), false);
+    // The wiring: a send's context load on an unbound conversation whose tab moved on follows the new video.
+    {
+      const followed = [];
+      const realFollow = ctx.followLiveVideo;
+      ctx.followLiveVideo = async (c) => followed.push(c.url);
+      activeTab = { id: 3, url: v("BV1bb") };
+      answer = async () => ({ ok: true, payload: { url: v("BV1bb"), title: "b", site: "bilibili", videoId: "BV1bb", isVideoContext: true } });
+      ctx.shown = { url: v("BV1aa"), site: "bilibili", videoId: "BV1aa", isVideoContext: true };
+      vm.runInContext("activeStream = null; chatHistory = []; currentConversationMeta = null; contextData = shown; currentContextKey = buildContextKey(shown); lastLiveVideoUrl = shown.url", ctx);
+      assert.strictEqual(await ctx.loadContextState({ silent: true }), "followed");
+      assert.deepStrictEqual(followed, [v("BV1bb")]);
+      // The first load only adopts.
+      vm.runInContext("contextData = null; currentContextKey = ''; lastLiveVideoUrl = ''", ctx);
+      assert.strictEqual(await ctx.loadContextState({ silent: true, follow: true }), true);
+      assert.deepStrictEqual(followed, [v("BV1bb")]);
+      ctx.followLiveVideo = realFollow;
+    }
+
+    // AI 总结 after a video switch fills once, in the conversation it was asked for; showing another one cancels it.
+    {
+      const fills = [];
+      ctx.fillPrompt = (text) => fills.push(text);
+      ctx.renderSuggestions = real.renderSuggestions;
+      ctx.renderFollowups = () => {};
+      ctx.shown = { url: v("BV1aa"), title: "a", site: "bilibili", videoId: "BV1aa", isVideoContext: true, subtitleMarkdown: "s" };
+      vm.runInContext('providers = [{}]; aiPrefs = { ...aiPrefs, playerAiQuickPrompt: "总结" }; suggestionsNode = document.createElement("div"); chatHistory = []; contextData = shown; summaryFillEpoch = conversationEpoch', ctx);
+      ctx.renderSuggestions();
+      ctx.renderSuggestions();
+      assert.deepStrictEqual(fills.splice(0), ["总结"], "filled once");
+      vm.runInContext('summaryFillEpoch = conversationEpoch; applyConversation({ id: "h", messages: [] }); contextData = shown', ctx);
+      ctx.renderSuggestions();
+      assert.deepStrictEqual(fills, [], "another conversation does not get it");
+      vm.runInContext("summaryFillEpoch = conversationEpoch", ctx);
+      real.restartChat();
+      ctx.renderSuggestions();
+      assert.deepStrictEqual(fills, [], "nor a fresh one");
+      ctx.renderSuggestions = () => {};
+      ctx.fillPrompt = real.fillPrompt;
+    }
+
+    // 新对话 while the AI is still answering keeps the reply: it goes on into the conversation it was asked in, like a
+    // video or conversation switch. Only a delete drops it.
+    {
+      const realLoad = ctx.loadContextState;
+      ctx.loadContextState = async () => true;
+      ctx.restartChat = real.restartChat;
+      let closed = 0;
+      ctx.stream = { prompt: "还在回答", raw: "", port: { disconnect: () => closed++ }, context: ctx.shown };
+      vm.runInContext("savedConversations = []; chatHistory = []; currentConversationId = ''; currentConversationMeta = null; contextData = shown; activeStream = stream", ctx);
+      await real.startNewConversation();
+      assert.strictEqual(closed, 0, "the reply is not cut off");
+      assert.deepStrictEqual([...vm.runInContext("[activeStream, savedConversations[0]?.messages[0]?.content, stream.conversationId === savedConversations[0]?.id, chatHistory.length]", ctx)], [null, "还在回答", true, 0]);
+      ctx.loadContextState = realLoad;
+    }
+
+    // The input draft belongs to the conversation: a switch of any kind starts the next one empty (AI 总结 puts its
+    // prompt there); within one conversation it stays.
+    {
+      const input = vm.runInContext("els.input", ctx);
+      input.value = "草稿";
+      await ctx.followLiveVideo(ctx.shown);
+      assert.strictEqual(input.value, "", "following another video");
+      vm.runInContext('currentConversationId = "c1"', ctx);
+      input.value = "草稿";
+      ctx.applyConversation({ id: "c1", messages: [] });
+      assert.strictEqual(input.value, "草稿", "the same conversation again");
+      ctx.applyConversation({ id: "c2", messages: [] });
+      assert.strictEqual(input.value, "", "another conversation");
+      input.value = "草稿";
+      ctx.showLiveContextInFreshConversation();
+      assert.strictEqual(input.value, "", "the shown conversation deleted");
+      input.value = "草稿";
+      const realStart = ctx.startNewConversation;
+      ctx.startNewConversation = async () => real.restartChat();
+      await ctx.runPlayerAiQuickActionPrompt("总结");
+      assert.strictEqual(input.value, "总结", "AI 总结 replaces the draft");
+      ctx.startNewConversation = realStart;
+      ctx.restartChat = () => {};
+    }
+
+    // A video opened from 分拣台 or 视频记录 is loading until its context resolves: no 「没有字幕」, no AI 总结, and the
+    // 快捷追问 say why they wait. A failed load ends it, and the error says what happened.
+    {
+      let pendingAtLoad;
+      ctx.hydratePinnedConversationContext = async () => (pendingAtLoad = vm.runInContext("contextData.pending", ctx));
+      ctx.restoreLatestConversationForCurrentContext = async () => false;
+      ctx.showConversationContextNotice = () => {};
+      vm.runInContext("activeStream = null; liveContextData = null; liveContextKey = ''", ctx);
+      await ctx.openRequestedVideoContext({ site: "bilibili", videoId: "BV1xx411c7mD", url: v("BV1xx411c7mD"), title: "t" });
+      assert.strictEqual(pendingAtLoad, true);
+      assert.strictEqual(ctx.followupBlockReason(), "正在读取视频字幕…");
+      ctx.hydratePinnedConversationContext = real.hydratePinnedConversationContext;
+      const realResolve = ctx.resolveConversationContext;
+      ctx.resolveConversationContext = async () => ({ ok: false, error: "x" });
+      ctx.showConversationContextError = () => {};
+      ctx.removeConversationContextNotice = () => {};
+      assert.strictEqual(await ctx.hydratePinnedConversationContext(), false);
+      assert.strictEqual(vm.runInContext("contextData.pending", ctx), false);
+      ctx.resolveConversationContext = realResolve;
+      ctx.restoreLatestConversationForCurrentContext = async () => {};
+    }
 
     // 导出对话 is disabled with its reason until there is a question with an answer.
     ctx.renderFollowups = () => {};
@@ -285,7 +441,7 @@ const page = (id) => ({ ok: true, payload: { url: `https://example.com/${id}`, t
     ctx.resolveConversationContext = realResolve;
   }
 
-  // A bad key or used-up quota offers 去设置 before 重试; a network error only 重试.
+  // A bad key, used-up quota, unreachable platform or timeout offers 去设置 before 重试, as 分拣台 does; others only 重试.
   {
     const errorButtons = (code) => {
       const kids = [];
@@ -293,7 +449,9 @@ const page = (id) => ({ ok: true, payload: { url: `https://example.com/${id}`, t
       return kids.slice(1).map((k) => (typeof k.textContent === "string" ? k.textContent : k.innerHTML.replace(/<[^>]*>/g, "")));
     };
     assert.deepStrictEqual(errorButtons("AI_QUOTA"), ["去设置", "重试"]);
-    assert.deepStrictEqual(errorButtons("AI_NETWORK"), ["重试"]);
+    assert.deepStrictEqual(errorButtons("AI_NETWORK"), ["去设置", "重试"]);
+    assert.deepStrictEqual(errorButtons("AI_TIMEOUT"), ["去设置", "重试"]);
+    assert.deepStrictEqual(errorButtons("AI_THROTTLED"), ["重试"]);
   }
 
   // Saved conversations: the video's title, the question and the AI's answer, in the history list and 上一个视频.

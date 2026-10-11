@@ -82,9 +82,9 @@ let streamSlowNoticeTimer = 0;
 let streamFirstTokenReceived = false;
 let initCompleted = false;
 let lastLiveVideoUrl = "";
-// Set by a video switch: once the new video's subtitles arrive, its summary prompt fills the input like a click on AI 总结.
-// Showing another conversation drops it.
-let summaryFillPending = false;
+// The conversationEpoch a video switch asked for the AI 总结 prompt in: once that conversation's subtitles arrive,
+// renderSuggestions fills it like a click on AI 总结, once. Any conversation shown since has a newer epoch, so it never gets it.
+let summaryFillEpoch = -1;
 let previousVideoConversationId = "";
 let previousVideoExpanded = false;
 let previousVideoBarSignature = "";
@@ -409,6 +409,8 @@ async function openRequestedVideoContext(ref) {
   if (!restored) {
     applyConversation({ id: "", contextKey: "", contextTitle: placeholder.title, contextUrl: placeholder.url, contextRef, messages: [] });
   }
+  // Until the video's context resolves, its placeholder has no subtitles: say it is loading, not 「没有字幕」.
+  if (contextData && !currentConversationMeta?.resolvedContext) contextData = { ...contextData, pending: true };
   renderInitialState();
   showConversationContextNotice("正在加载原视频信息…");
   await hydratePinnedConversationContext();
@@ -431,10 +433,7 @@ async function runPlayerAiQuickActionPrompt(prompt) {
     els.input?.focus?.();
     return;
   }
-  // startNewConversation clears the input, so a draft the user was typing is put back instead of replaced.
-  const draft = els.input.value;
   await startNewConversation();
-  els.input.value = draft;
   fillPrompt(text);
 }
 
@@ -497,14 +496,14 @@ async function readContextState({ forceRefresh = false, silent = false, follow =
 
   liveTabUrl = String(tab.url || "").trim();
   // Subtitles and comments take seconds to load, but the tab URL already names the new video, so following
-  // switches now and the full reply below fills the context in. Watch-later URLs name the part by oid, not ?p=.
-  const tabRef = follow ? BocSites.parseRef(liveTabUrl) : null;
-  let followed = false;
-  if (tabRef && !tabRef.part?.oid && isFollowCandidate(lastLiveVideoUrl, tabRef.url)) {
-    lastLiveVideoUrl = tabRef.url;
+  // switches now and the full reply below fills the context in.
+  const tabRef = BocSites.parseRef(liveTabUrl);
+  const atTab = decideFollow(snapshotFollowState(), { stage: "tab", toUrl: tabRef?.url || "", oid: Boolean(tabRef?.part?.oid), follow });
+  lastLiveVideoUrl = atTab.lastVideoUrl;
+  const followed = atTab.action === "follow";
+  if (followed) {
     await detachActiveStream();
     await followLiveVideo(buildTabVideoPlaceholder(tab, tabRef));
-    followed = true;
   }
 
   const resp = await sendRuntimeMessage({
@@ -530,17 +529,15 @@ async function readContextState({ forceRefresh = false, silent = false, follow =
 
   liveContextData = resp.payload;
   liveContextKey = buildContextKey(resp.payload);
-  const followFromUrl = lastLiveVideoUrl;
   const liveVideoUrl = resp.payload.isVideoContext !== false && liveContextKey.startsWith("video:") ? String(resp.payload.url || "") : "";
-  if (liveVideoUrl) {
-    lastLiveVideoUrl = liveVideoUrl;
-  }
-  if (follow && isFollowCandidate(followFromUrl, liveVideoUrl)) {
+  const decision = decideFollow(snapshotFollowState(), { stage: "payload", toUrl: liveVideoUrl, follow, keyChanged: contextKeyChanges(resp.payload) });
+  lastLiveVideoUrl = decision.lastVideoUrl;
+  if (decision.action === "follow") {
     await detachActiveStream();
     await followLiveVideo(liveContextData);
     return FOLLOWED_LIVE_VIDEO;
   }
-  if (isContextBound()) {
+  if (decision.action === "keep") {
     renderHistoryList();
     updateContextChip();
     return followed ? FOLLOWED_LIVE_VIDEO : true;
@@ -566,16 +563,18 @@ function buildTabVideoPlaceholder(tab, ref) {
   };
 }
 
+// An empty key (loading or blank tab) is a different context too, so returning to a video restores its conversation.
+// A followed video's placeholder has no cid yet, so its full context is matched by URL.
+function contextKeyChanges(payload) {
+  const fillsPlaceholder = Boolean(contextData?.pending && doesTabMatchContextUrl(payload?.url || "", contextData.url));
+  return !fillsPlaceholder && buildContextKey(payload) !== currentContextKey;
+}
+
 function applyContextPayload(payload) {
   const nextContext = payload && typeof payload === "object" ? payload : null;
-  const nextKey = buildContextKey(nextContext);
-  // An empty key (loading or blank tab) is a different context too, so returning to a video restores its conversation.
-  // A followed video's placeholder has no cid yet, so its full context is matched by URL.
-  const fillsPlaceholder = Boolean(contextData?.pending && doesTabMatchContextUrl(nextContext?.url || "", contextData.url));
-  const contextChanged = !fillsPlaceholder && nextKey !== currentContextKey;
-
+  const contextChanged = contextKeyChanges(nextContext);
   contextData = nextContext;
-  currentContextKey = nextKey;
+  currentContextKey = buildContextKey(nextContext);
   updateContextChip();
 
   if (contextChanged) {
@@ -798,8 +797,8 @@ function renderSuggestions() {
   const prompt = aiPrefs.playerAiQuickPrompt;
   suggestionsNode.innerHTML = `<p class="sp-empty-intro">${escapeHtml(introText())}</p>${prompt ? `<button type="button" class="sp-summary-btn" title="${escapeHtml(prompt)}">${AI_SPARK}AI 总结</button>` : ""}`;
   suggestionsNode.querySelector(".sp-summary-btn")?.addEventListener("click", () => fillPrompt(prompt));
-  if (summaryFillPending && prompt) {
-    summaryFillPending = false;
+  if (summaryFillEpoch === conversationEpoch && prompt) {
+    summaryFillEpoch = -1;
     fillPrompt(prompt);
   }
   void renderTriageSummary(suggestionsNode);
@@ -1143,6 +1142,8 @@ async function saveConversations() {
   renderHistoryList();
 }
 
+// Finding none does not bump conversationEpoch: callers have just started a fresh conversation (restartChat bumped it)
+// or show nothing yet (init).
 async function restoreLatestConversationForCurrentContext(currentRef = liveContextData || contextData, targetContextKey = liveContextKey || currentContextKey) {
   const latest = savedConversations.find((item) => doesConversationMatchCurrentContext(item, currentRef, targetContextKey));
   if (!latest) {
@@ -1182,7 +1183,11 @@ function applyConversation(conversation) {
     return;
   }
   conversationEpoch += 1;
-  summaryFillPending = false;
+  // The input draft belongs to the conversation: another one starts empty (restartChat clears it for a fresh one).
+  if (!conversation.id || conversation.id !== currentConversationId) {
+    els.input.value = "";
+    autosizeInput();
+  }
   currentConversationId = conversation.id;
   currentConversationMeta = {
     id: conversation.id,
@@ -1248,10 +1253,7 @@ function adoptLiveContext() {
 // restartChat also drops the reply in flight without saving it, so it cannot bring the conversation back.
 function showLiveContextInFreshConversation() {
   adoptLiveContext();
-  const draft = els.input.value;
   restartChat();
-  els.input.value = draft;
-  autosizeInput();
   renderInitialState();
 }
 
@@ -1351,21 +1353,40 @@ async function syncLiveContextState(forceRefresh = false) {
   renderSuggestions();
 }
 
-// 跟随播放：只在当前对话绑定的是“刚才在播的视频”（或还没有对话）时才切走，
-// 用户主动打开的无关历史对话不动。视频按 URL（站点、id、分 P）比较，标签页 URL 和完整上下文都能判断。
-// 还没提问的对话（网页上打开的、分拣台「问 AI」开的空对话）跟着任何别的视频走，不需要“刚才在播的视频”。
-function isFollowCandidate(fromUrl, toUrl) {
-  const shownUrl = currentConversationMeta?.contextUrl || contextData?.url || "";
-  if (!toUrl) {
-    return false;
+// What a context load does with the tab's video (跟随播放). Pure; snapshotFollowState() reads the page's state.
+// state: shownUrl (the shown conversation's video), hasMessages, bound (isContextBound), lastVideoUrl (the tab's video
+// when a load last took or watched it), hasContext (a context was read before; false on the panel's first load).
+// ev: stage "tab" (only the tab URL is known yet) or "payload" (the full context came back); toUrl (the tab's video,
+// "" when it is not one); oid (a watch-later URL names the part by oid, not ?p=, so only the payload can place it);
+// follow (a tab event asked to follow); keyChanged (payload: the tab's context is not the shown one).
+// action: "follow" (show the tab's video: its latest conversation or a fresh one), "keep" (the conversation holds its
+// context), "adopt" (the unbound conversation takes the payload), "none" (tab stage: wait for the payload).
+// Videos compare by URL (site, id, part). Following only leaves a conversation that belongs to the video just played,
+// or one with nothing asked yet (opened on a web page, an empty 问 AI one); a history conversation the user opened stays.
+// An unbound conversation on another video follows whichever load saw the change, so every entry ends alike; the panel's
+// first load only adopts, without the AI 总结 fill. lastVideoUrl moves when the panel takes the tab's video or a follow
+// load watches it, never on a load that leaves a bound conversation in place.
+function decideFollow({ shownUrl, hasMessages, bound, lastVideoUrl, hasContext }, { stage, toUrl, oid, follow, keyChanged }) {
+  const same = doesTabMatchContextUrl;
+  const candidate = Boolean(toUrl) && (hasMessages ? Boolean(lastVideoUrl) && !same(toUrl, lastVideoUrl) && same(shownUrl, lastVideoUrl) : !same(toUrl, shownUrl));
+  if (stage === "tab") {
+    return follow && hasContext && !oid && candidate ? { action: "follow", lastVideoUrl: toUrl } : { action: "none", lastVideoUrl };
   }
-  if (!chatHistory.length) {
-    return !doesTabMatchContextUrl(toUrl, shownUrl);
-  }
-  if (!fromUrl || doesTabMatchContextUrl(toUrl, fromUrl)) {
-    return false;
-  }
-  return doesTabMatchContextUrl(shownUrl, fromUrl);
+  const taken = toUrl || lastVideoUrl;
+  if (!hasContext) return { action: "adopt", lastVideoUrl: taken };
+  if ((follow && candidate) || (!bound && keyChanged && toUrl)) return { action: "follow", lastVideoUrl: toUrl };
+  if (bound) return { action: "keep", lastVideoUrl: follow ? taken : lastVideoUrl };
+  return { action: "adopt", lastVideoUrl: taken };
+}
+
+function snapshotFollowState() {
+  return {
+    shownUrl: currentConversationMeta?.contextUrl || contextData?.url || "",
+    hasMessages: chatHistory.length > 0,
+    bound: isContextBound(),
+    lastVideoUrl: lastLiveVideoUrl,
+    hasContext: Boolean(contextData)
+  };
 }
 
 // Switching videos mid-reply hands the reply to its saved conversation, which then becomes the previous-video bar.
@@ -1420,12 +1441,9 @@ async function followLiveVideo(context) {
   }
   contextData = { ...context };
   currentContextKey = buildContextKey(context);
-  const draft = els.input.value;
   restartChat();
-  els.input.value = draft;
-  autosizeInput();
   await restoreLatestConversationForCurrentContext(contextData, currentContextKey);
-  summaryFillPending = !chatHistory.length;
+  if (!chatHistory.length) summaryFillEpoch = conversationEpoch;
   renderHistoryList();
   updateContextChip();
   renderInitialState();
@@ -1614,9 +1632,11 @@ async function refreshContextManually() {
   }
 }
 
+// A reply in flight goes on into the conversation it was asked in, as when switching video or conversation.
 async function startNewConversation() {
   hidePresetPopover();
   hideHistoryPopover();
+  await detachActiveStream();
   await loadContextState({ forceRefresh: true, silent: true });
   adoptLiveContext();
   restartChat();
@@ -1913,6 +1933,12 @@ async function hydratePinnedConversationContext({ silent = false } = {}) {
   }
   if (!response?.ok || !response.payload) {
     removeConversationContextNotice();
+    // Nothing is loading any more: the error below is the state, and a send tries again.
+    if (contextData?.pending) {
+      contextData = { ...contextData, pending: false };
+      updateContextChip();
+      suggestionsNode?.replaceChildren();
+    }
     if (!silent) {
       // Deleted or hidden on B站 (as the 分拣台 and 视频记录 tell it): no retry will bring it back.
       showConversationContextError(BocSites.isBiliVideoGone(response?.code) ? "视频已失效，这段对话只能查看，不能继续提问。" : `读取原视频失败：${response?.error || "未知错误"}`);
@@ -2139,8 +2165,7 @@ function appendStreamError({ node, prompt, raw }, error, saved, code = "") {
     });
     node.appendChild(grant);
   }
-  // Errors that only a settings change fixes (codes from triageAiHttpError in triage-bg.js, and background.js for a
-  // missing key, base URL or model): 去设置 comes before 重试.
+  // The AI platform errors 分拣台 stops on (BocErrors.CODES): 去设置 comes before 重试.
   if (BocErrors.action(code) === "settings") {
     const settings = document.createElement("button");
     settings.type = "button";
@@ -2258,7 +2283,7 @@ function renderAssistantMessage(node, raw) {
 
 // The conversation as its own note: copy, download, and 写入 Obsidian on pages that are not videos.
 // Like the 视频记录 page's export, the triage summary (bilibili P1 only) and the video's note lead it.
-async function buildCurrentConversationNote() {
+async function buildCurrentConversationNote(sourcePath = "") {
   const turns = buildConversationTurns(chatHistory);
   if (!turns.length) {
     return null;
@@ -2269,7 +2294,7 @@ async function buildCurrentConversationNote() {
   const ref = buildConversationContextRef(context);
   const extrasRef = { site: ref.site, videoId: noteId, pageIndex: ref.pageIndex };
   const { analysis, note } = BocNote.triageExtras(await chrome.storage.local.get(BocNote.triageExtrasKeys(extrasRef)), extrasRef);
-  const markdown = buildAiConversationMarkdown({ context, turns, filename });
+  const markdown = buildAiConversationMarkdown({ context, turns, filename, sourcePath });
   return { context, filename, content: BocNote.withTriageSummary(markdown, analysis, note) };
 }
 
@@ -2434,15 +2459,29 @@ async function saveCurrentConversationToObsidian() {
         await saveBuiltVideoNoteToObsidian(ref, messages, epoch, settingsBundle);
         return;
       }
-      showConversationContextNotice("这个视频还没有视频笔记，打开视频页后再写入 Obsidian。", 4000);
+      // Only a B站 P1 note can be built without the page; others get the conversation as its own note, as on 视频记录.
+      if (epoch !== conversationEpoch) {
+        throw new Error("对话已切换");
+      }
+      const sourcePath = await resolveVideoNotePath(context, settingsBundle.settings);
+      const filepath = await saveConversationNoteToObsidian(settingsBundle, sourcePath);
+      if (filepath) {
+        showConversationContextNotice(`已写入 Obsidian：${filepath}（单独的对话笔记）`, 4000);
+      }
       return;
     }
     const resp = await sendMessageToActiveTab(tab.id, { type: "popup-send-obsidian" }, 1);
+    // The page replies its reason and code when the write failed, as the background does.
+    if (!resp?.ok) {
+      throw BocErrors.fromResp(resp, "没能新建视频笔记");
+    }
     // The page's note carries its latest conversation; the live context (the page's own key and path)
     // finds the note it just wrote, and this conversation replaces that section.
-    const created = resp?.ok ? await syncVideoNoteAiSection({ context: live, messages, ...settingsBundle }) : null;
+    const created = await syncVideoNoteAiSection({ context: live, messages, ...settingsBundle });
+    // Not written and not failed (the overwrite declined, the video switched): the page's own line says why.
     if (!created?.exists) {
-      throw new Error(resp?.error || resp?.payload?.message || "没能新建视频笔记");
+      showConversationContextNotice(resp.payload?.message || "没能新建视频笔记", 4000);
+      return;
     }
     showConversationContextNotice(`已写入 Obsidian：${created.filepath}`, 4000);
   } catch (error) {
@@ -2450,9 +2489,9 @@ async function saveCurrentConversationToObsidian() {
   }
 }
 
-// The conversation as its own note, at the folder template's path.
-async function saveConversationNoteToObsidian(settingsBundle) {
-  const note = await buildCurrentConversationNote();
+// The conversation as its own note, at the folder template's path. sourcePath: the video note it links to, if any.
+async function saveConversationNoteToObsidian(settingsBundle, sourcePath = "") {
+  const note = await buildCurrentConversationNote(sourcePath);
   const folder = resolveFolderTemplate(settingsBundle.settings.noteFolder || "", note.context);
   const filepath = folder ? `${folder}/${note.filename}` : note.filename;
   return (await saveMarkdownToObsidian({ button: els.saveConversationBtn, filepath, content: note.content, ...settingsBundle })) ? filepath : "";
@@ -2710,7 +2749,6 @@ function delay(ms) {
 
 function restartChat() {
   conversationEpoch += 1;
-  summaryFillPending = false;
   clearStreamRuntimeState();
   if (activeStream) {
     closeStream(activeStream);

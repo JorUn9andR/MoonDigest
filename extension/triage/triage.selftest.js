@@ -25,6 +25,7 @@ const syncStore = {};
 const handlers = {};
 const sent = [];
 const docL = {}; // document listeners: typing.js's composition flag, onKey
+const winL = {}; // window listeners: beforeunload
 // tag-dialogs.js stands in: each open records [which dialog, the mode's adapter] (tag-dialogs.selftest.js tests the dialogs).
 const dialogs = [];
 const TagDialogs = {
@@ -41,7 +42,7 @@ const ctx = vm.createContext({
   clearTimeout: (id) => clearImmediate(id),
   // No #tagPicker: tag-picker.js gives only its pure part; the tests stand in for the dialog (pickWith).
   document: { getElementById: (id) => (id === "tagPicker" ? null : stubEl()), querySelector: () => null, querySelectorAll: () => [], addEventListener: (t, f) => (docL[t] ||= []).push(f) },
-  window: { addEventListener() {} },
+  window: { addEventListener: (t, f) => (winL[t] ||= []).push(f) },
   chrome: {
     runtime: {
       id: "test",
@@ -244,6 +245,22 @@ const unfavOnlyOf = (d) => Object.fromEntries(Object.entries(d).filter(([, v]) =
   await t.undo();
   assert.deepStrictEqual([refavs, store[t.K.decisions("D")], toasts.at(-1)], [3, {}, "「D」已重新收藏 3 个"]);
 
+  // G7: while a 重新收藏 runs, no batch 取消收藏 / 移动 starts and U leaves the next batch undo for later.
+  {
+    openFake("D", three);
+    t.S.undo = [{ kind: "unfavMany", items: [{ bvid: "BV1", aid: 1001 }] }];
+    t.S.refavRun = { mediaId: "D", folder: "D", done: 1, total: 5 };
+    let asked = 0;
+    const savedAsk = t.askConfirm;
+    t.askConfirm = async () => (asked++, true);
+    await t.batchUnfav(three);
+    await t.undo();
+    t.askConfirm = savedAsk;
+    assert.deepStrictEqual([asked, t.S.undo.length, toasts.at(-1)], [0, 1, "重新收藏还在跑，等它完成再撤销"]);
+    t.S.refavRun = null;
+    t.S.undo = [];
+  }
+
   // 所有收藏夹: batch 取消收藏 asks which folders (each with its count), then goes folder by folder, naming it; a video
   // leaves each checked folder it is in, and the view only once it is in none. One U puts it back in every one.
   {
@@ -270,9 +287,13 @@ const unfavOnlyOf = (d) => Object.fromEntries(Object.entries(d).filter(([, v]) =
     assert.deepStrictEqual([Object.keys(store[t.K.decisions("W1")]), Object.keys(store[t.K.decisions("W2")])], [["BV60", "BV61"], ["BV61", "BV62"]]);
     assert.deepStrictEqual(plain(t.batchUndoAsk(t.S.undo.at(-1))).at(-1), "重新收藏 3 个");
     const refav = [];
-    handlers["triage-refav"] = (m) => (refav.push([m.mediaId, m.aid]), { ok: true });
+    const pills = [];
+    handlers["triage-refav"] = (m) => (refav.push([m.mediaId, m.aid]), pills.push([t.activityState().text, vm.runInContext("batchWriting()", ctx), t.writingTo(m.mediaId)]), { ok: true });
     await t.undo();
     assert.deepStrictEqual(refav, [["W1", 1060], ["W1", 1061], ["W2", 1061], ["W2", 1062]]);
+    // G7: the undo shows in the pill, folder by folder, and counts as a batch write on the folder it writes to.
+    assert.deepStrictEqual(pills, [["重新收藏中「夹1」 0/4", "重新收藏", true], ["重新收藏中「夹1」 1/4", "重新收藏", true], ["重新收藏中「夹2」 2/4", "重新收藏", true], ["重新收藏中「夹2」 3/4", "重新收藏", true]]);
+    assert.strictEqual(t.S.refavRun, null);
     assert.deepStrictEqual(plain(vids.map((it) => [...it.folders].sort())), [["W1"], ["W1", "W2"], ["W2", "W3"]]);
     assert.deepStrictEqual([t.S.decisions, store[t.K.decisions("W1")], store[t.K.decisions("W2")], t.S.undo.length], [{}, {}, {}, 0]);
     // 保留 is one list for every folder: the batch marks it everywhere, one U takes it back.
@@ -564,12 +585,20 @@ const unfavOnlyOf = (d) => Object.fromEntries(Object.entries(d).filter(([, v]) =
   assert.ok(t.el.listHeader.innerHTML.includes('aria-label="暂停中 0/1" disabled title="当前视频细看完就暂停" aria-description="当前视频细看完就暂停">暂停中 0/1</button>'), t.el.listHeader.innerHTML);
   t.S.group = null;
   assert.deepStrictEqual(plain(t.activityState()), { text: "标题粗看中 2/5", done: 2, total: 5, act: "stage1", actLabel: "暂停粗看", stopping: false, stuck: false });
-  Object.assign(t.S, { throttleUntil: Date.now() + 61000, throttleLabel: "B站限流卡住" });
+  t.S.waits = { stage1: { until: Date.now() + 61000, label: "AI 平台限流卡住" } };
   const waiting = t.activityState();
-  assert.ok(waiting.stuck && waiting.text.startsWith("B站限流卡住，") && waiting.act === "stage1", "a wait shows its countdown and keeps 暂停粗看");
+  assert.ok(waiting.stuck && waiting.text.startsWith("AI 平台限流卡住，") && waiting.act === "stage1", "a wait shows its countdown and keeps 暂停粗看");
+  // L1: B站 and AI waits are kept per job: 细看 waiting on B站 shows its own countdown, not 粗看's AI one.
+  t.S.group = { bvids: ["BV207"], stop: false, mediaId: String(t.S.mediaId), items: t.S.itemMap, text: "字幕细看 1/1" };
+  assert.strictEqual(t.activityState().text, "字幕细看 1/1", "粗看's AI wait is not 细看's");
+  t.S.waits.group = { until: Date.now() + 300000, label: "B站限流卡住" };
+  assert.ok(t.activityState().text.startsWith("B站限流卡住，5:00") || t.activityState().text.startsWith("B站限流卡住，4:59"), t.activityState().text);
+  delete t.S.waits.group;
+  t.S.group = null;
+  assert.ok(t.activityState().text.startsWith("AI 平台限流卡住，"), "细看's wait ending leaves 粗看's");
   t.S.stage1 = { ...t.S.stage1, running: false, text: "" };
   assert.ok(t.activityState().stuck && !t.activityState().act, "a wait alone has no button");
-  t.S.throttleUntil = 0;
+  t.S.waits = {};
   assert.strictEqual(t.activityState(), null, "nothing running hides the pill");
   // 观看进度: pages read while this page waits on the read; B站 risk control shows the wait, and 刷新 during it says so.
   t.S.seenCfg.on = true;
@@ -1621,6 +1650,22 @@ const unfavOnlyOf = (d) => Object.fromEntries(Object.entries(d).filter(([, v]) =
     t.S.settings.triageAiRemoveTags = false;
   }
 
+  // G1: while a notes export or a B站 batch write runs, closing or reloading the page asks first.
+  {
+    const leave = () => {
+      let asked = false;
+      winL.beforeunload.forEach((f) => f({ preventDefault: () => (asked = true) }));
+      return asked;
+    };
+    assert.strictEqual(leave(), false, "nothing running: no prompt");
+    t.S.write.running = true;
+    assert.strictEqual(leave(), true, "notes export");
+    t.S.write.running = false;
+    t.S.refavRun = { mediaId: "K", done: 0, total: 3 };
+    assert.strictEqual(leave(), true, "batch re-favorite");
+    t.S.refavRun = null;
+  }
+
   // 批量打标签 keeps running when another folder opens; its proposal stays with its folder and shows on return.
   openFake("K", [item(600), item(601)]);
   t.S.folders = t.S.allFolders = [{ id: "K", title: "夹K" }, { id: "L", title: "夹L" }];
@@ -1643,7 +1688,13 @@ const unfavOnlyOf = (d) => Object.fromEntries(Object.entries(d).filter(([, v]) =
   assert.deepStrictEqual(plain(vm.runInContext("activityState()", ctx)), { text: "「夹K」的标签建议待确认", act: "aiOther", actLabel: "查看" }, "folder L points back to K");
   openFake("K", [item(600), item(601)]);
   assert.deepStrictEqual(plain(t.S.ai.proposal.rows.map((r) => [r.id, r.add])), [["BV600", ["id:a"]], ["BV601", ["id:a"]]], "K's own 旧, not L's");
+  // G1: the proposal is saved, so a reload keeps it; one naming a deleted tag is dropped, and discarding removes it.
+  assert.deepStrictEqual(plain(store[t.K.aiProposals].K), plain(t.S.ai.proposal));
+  t.S.ai.proposals = { K: t.S.ai.proposal, L: { newTags: [], notes: [], errors: [], rows: [{ id: "BV700", add: ["id:gone"], remove: [] }] } };
+  t.pruneAiProposals();
+  assert.deepStrictEqual([Object.keys(t.S.ai.proposals), Object.keys(store[t.K.aiProposals])], [["K"], ["K"]], "L's names a deleted tag");
   t.S.ai.proposal = null;
+  assert.deepStrictEqual(store[t.K.aiProposals], {});
   Object.assign(t.S.settings, { triageTitleBatchSize: 30 });
 
   // Opening a folder with a cached list shows it without the full sync; changed ids still sync once.
@@ -1663,6 +1714,11 @@ const unfavOnlyOf = (d) => Object.fromEntries(Object.entries(d).filter(([, v]) =
   delete store.triage_snapshot_2.intro;
   await t.openFolder("2");
   assert.strictEqual(synced, 2, "a snapshot without the intro syncs instead");
+  // S2: a failed first read still resets the step and chips, so the page is not folder B with A's tabs and filters.
+  Object.assign(t.S, { tab: "fine", classFilter: { coarse: "all", fine: "drop", read: "all" } });
+  t.syncFolder = async () => false;
+  await t.openFolder("2");
+  assert.deepStrictEqual([t.S.tab !== "fine", t.S.classFilter.fine], [true, "all"], "a failed open drops the last folder's step and chips");
 
   // Changed ids fetch only the newest pages: removed videos leave, added ones come from the head, the rest from the cache.
   assert.deepStrictEqual(plain(t.mergeHead([item(8)], [item(2), item(3)], ["BV2", "BV3"], ["BV8", "BV2"]).map((it) => it.bvid)), ["BV8", "BV2"]);
@@ -1873,12 +1929,11 @@ const unfavOnlyOf = (d) => Object.fromEntries(Object.entries(d).filter(([, v]) =
       return ++calls === 1 ? { ok: false, code: "THROTTLED", error: "412" } : { ok: true, data: { items: [item(7)], ids: ["BV7"], info: { intro: "" } } };
     };
     const realWait = t.throttleWait;
-    t.throttleWait = async (code) => {
-      t.S.throttleUntil = Date.now() + 90000;
-      t.S.throttleLabel = "B站限流卡住";
+    t.throttleWait = async (code, keepGoing, job) => {
+      t.S.waits[job] = { until: Date.now() + 90000, label: "B站限流卡住" };
       const a = t.activityState();
       seen.push([a.text, a.stuck, a.actLabel]);
-      t.S.throttleUntil = 0;
+      delete t.S.waits[job];
     };
     t.S.loadAll = { lists: {}, check: [], checkTotal: 0, queue: ["6"], paused: false, running: false, error: "", partial: 0 };
     await t.runLoadAll(t.S.folderToken);

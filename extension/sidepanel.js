@@ -16,7 +16,7 @@ const {
 const PLAYER_AI_QUICK_ACTION_STORAGE_KEY = BocLimits.KEYS.playerAiQuickAction;
 // Marks a control that starts an AI request (tokens.css draws it in the text color).
 const AI_SPARK = '<span class="ai-spark" aria-hidden="true"></span>';
-const NON_VIDEO_CONTEXT_MESSAGE = "这不是支持的视频页。";
+const NON_VIDEO_CONTEXT_MESSAGE = "当前网页不是支持的视频页";
 const EMPTY_INTRO = "AI 会读这期视频的字幕和评论，回答你的问题。";
 const STREAM_SLOW_NOTICE_MS = 15000;
 const PREVIOUS_VIDEO_CONVERSATION_KEY = "boc_sp_previous_video_conversation";
@@ -57,12 +57,6 @@ const els = {
 };
 const NOTES_STORAGE_KEY = BocLimits.KEYS.triageNotes;
 
-const DEFAULT_AI_PREFS = {
-  aiSystemPrompt: "",
-  playerAiQuickPrompt: "",
-  aiPresetPrompts: []
-};
-
 let contextData = null;
 let currentContextKey = "";
 let providers = [];
@@ -70,7 +64,8 @@ let activeStream = null;
 let sendPending = false;
 let chatHistory = [];
 let suggestionsNode = null;
-let aiPrefs = { ...DEFAULT_AI_PREFS };
+// The AI settings as get-settings returns them; BocSettings.DEFAULTS until then or when it fails.
+let aiPrefs = aiPrefsOf(BocSettings.DEFAULTS);
 let savedConversations = [];
 let currentConversationId = "";
 let currentConversationMeta = null;
@@ -290,17 +285,16 @@ async function loadProvidersAndPrefs({ preferredProviderId = "" } = {}) {
   providers = Array.isArray(providersResp?.providers)
     ? providersResp.providers.filter((p) => p.enabled)
     : [];
-  document.body.classList.toggle("sp-obsidian-off", settingsResp?.settings?.obsidianEnabled !== true);
-  aiPrefs = {
-    aiSystemPrompt: String(settingsResp?.settings?.aiSystemPrompt || "").trim(),
-    playerAiQuickPrompt: String(settingsResp?.settings?.playerAiQuickPrompt || "").trim(),
-    aiPresetPrompts: Array.isArray(settingsResp?.settings?.aiPresetPrompts)
-      ? settingsResp.settings.aiPresetPrompts.map((item) => String(item || "").trim()).filter(Boolean).slice(0, 12)
-      : []
-  };
+  const settings = settingsResp?.ok && settingsResp.settings ? settingsResp.settings : BocSettings.DEFAULTS;
+  document.body.classList.toggle("sp-obsidian-off", settings.obsidianEnabled !== true);
+  aiPrefs = aiPrefsOf(settings);
   renderModelSelect(preferredProviderId);
   renderPresetPrompts();
   renderFollowups();
+}
+
+function aiPrefsOf({ aiSystemPrompt, playerAiQuickPrompt, aiPresetPrompts }) {
+  return { aiSystemPrompt, playerAiQuickPrompt, aiPresetPrompts: [...aiPresetPrompts] };
 }
 
 function renderModelSelect(preferredProviderId = "") {
@@ -363,8 +357,7 @@ function normalizePlayerAiQuickActionRequest(value) {
     prompt,
     tabId,
     createdAt: Number(value.createdAt) || Date.now(),
-    contextRef: value.contextRef && typeof value.contextRef === "object" ? value.contextRef : null,
-    showSaved: value.showSaved === true
+    contextRef: value.contextRef && typeof value.contextRef === "object" ? value.contextRef : null
   };
 }
 
@@ -395,45 +388,40 @@ async function handlePlayerAiQuickActionRequest(value, { fromStorageChange = tru
     await chrome.storage.local.remove(PLAYER_AI_QUICK_ACTION_STORAGE_KEY).catch(() => null);
   }
 
-  if (request.showSaved) {
-    await showLiveVideoConversation();
-    return true;
-  }
+  // AI 总结 (popup, player ✦, 专注模式, 分拣台's viewer) on a video that already has a conversation opens its latest one;
+  // only a video without one gets the summary prompt.
   if (request.contextRef) {
-    await openRequestedVideoContext(request.contextRef);
     // A new conversation would fall back to this tab's own page (分拣台), so the prompt goes into the video's one.
-    fillPrompt(request.prompt);
+    if (!(await openRequestedVideoContext(request.contextRef))) fillPrompt(request.prompt);
     return true;
   }
-  await runPlayerAiQuickActionPrompt(request.prompt);
+  if (!(await showLiveVideoConversation())) await runPlayerAiQuickActionPrompt(request.prompt);
   return true;
 }
 
 // The triage and history pages hand over a video that is not open: continue its latest conversation,
-// else start one bound to it, and resolve the context like a history conversation.
+// else start one bound to it, and resolve the context like a history conversation. True when one was continued.
 async function openRequestedVideoContext(ref) {
   await detachActiveStream();
   const contextRef = normalizeConversationContextRef(ref);
   const placeholder = buildContextPlaceholder(contextRef);
-  if (!(await restoreLatestConversationForCurrentContext(placeholder, buildContextKey(placeholder)))) {
+  const restored = await restoreLatestConversationForCurrentContext(placeholder, buildContextKey(placeholder));
+  if (!restored) {
     applyConversation({ id: "", contextKey: "", contextTitle: placeholder.title, contextUrl: placeholder.url, contextRef, messages: [] });
   }
   renderInitialState();
   showConversationContextNotice("正在加载原视频信息…");
   await hydratePinnedConversationContext();
+  return restored;
 }
 
-// The popup's AI 总结 on a video that already has a conversation: show its latest one, even over an unrelated
-// history conversation the open panel was showing.
+// The tab's video has a saved conversation: show its latest one, even over an unrelated history conversation the
+// open panel was showing. False when it has none.
 async function showLiveVideoConversation() {
   await loadContextState({ silent: true });
   const latest = savedConversations.find((item) => doesConversationMatchCurrentContext(item, liveContextData, liveContextKey));
-  if (latest) {
-    await loadConversationById(latest.id);
-    return;
-  }
-  await detachActiveStream();
-  showLiveContextInFreshConversation();
+  if (latest) await loadConversationById(latest.id);
+  return Boolean(latest);
 }
 
 async function runPlayerAiQuickActionPrompt(prompt) {
@@ -1561,14 +1549,14 @@ async function addPresetPrompt() {
   }
   const nextPrompts = [...(aiPrefs.aiPresetPrompts || [])];
   if (!nextPrompts.includes(text)) {
-    // A 13th would be cut by the slice below; keep the input so the text is not lost.
-    if (nextPrompts.length >= 12) {
-      showConversationContextNotice("最多 12 条快捷追问，先删掉一条再添加。", 2600);
+    // One past the limit would be cut when saved; keep the input so the text is not lost.
+    if (nextPrompts.length >= BocSettings.MAX_PRESET_PROMPTS) {
+      showConversationContextNotice(`最多 ${BocSettings.MAX_PRESET_PROMPTS} 条快捷追问，先删掉一条再添加。`, 2600);
       return;
     }
     nextPrompts.push(text);
   }
-  aiPrefs.aiPresetPrompts = nextPrompts.slice(0, 12);
+  aiPrefs.aiPresetPrompts = nextPrompts;
   await persistAiPresetPrompts();
   els.presetInput.value = "";
   renderPresetPrompts();
@@ -1587,7 +1575,7 @@ async function removePresetPrompt(index) {
 
 // save-settings keeps the keys it is not sent.
 async function persistAiPresetPrompts() {
-  await sendRuntimeMessage({ type: "save-settings", settings: { aiPresetPrompts: (aiPrefs.aiPresetPrompts || []).slice(0, 12) } }).catch(() => null);
+  await sendRuntimeMessage({ type: "save-settings", settings: { aiPresetPrompts: aiPrefs.aiPresetPrompts } }).catch(() => null);
 }
 
 function updateSidepanelLayoutState() {
@@ -2528,14 +2516,10 @@ async function saveMarkdownToObsidian({ button, filepath, content, baseUrl, apiK
     if (button) {
       button.disabled = true;
     }
-    const exists = await checkObsidianNoteExists(baseUrl, apiKey, filepath);
-    if (exists) {
-      if (!(await BocOverwriteDialog.choose(filepath))) {
-        showConversationContextNotice("已取消写入 Obsidian，原笔记未被覆盖。", 2200);
-        return false;
-      }
+    if (!(await BocOverwriteDialog.writeNote({ baseUrl, apiKey, filepath, content }))) {
+      showConversationContextNotice("已取消写入 Obsidian，原笔记未被覆盖。", 2200);
+      return false;
     }
-    await writeNoteByLocalApi(baseUrl, apiKey, filepath, content);
     showConversationContextNotice(`已写入 Obsidian：${filepath}`, 2600);
     return true;
   } catch (error) {
@@ -2546,32 +2530,6 @@ async function saveMarkdownToObsidian({ button, filepath, content, baseUrl, apiK
         button.disabled = false;
       }, 500);
     }
-  }
-}
-
-async function checkObsidianNoteExists(baseUrl, apiKey, filepath) {
-  const resp = await sendRuntimeMessage({
-    type: "obsidian-note-exists",
-    baseUrl,
-    apiKey,
-    filepath
-  });
-  if (!resp?.ok) {
-    throw BocErrors.fromResp(resp, "Local API 检查失败");
-  }
-  return Boolean(resp.exists);
-}
-
-async function writeNoteByLocalApi(baseUrl, apiKey, filepath, content) {
-  const resp = await sendRuntimeMessage({
-    type: "write-obsidian-note",
-    baseUrl,
-    apiKey,
-    filepath,
-    content
-  });
-  if (!resp?.ok) {
-    throw BocErrors.fromResp(resp, "Local API 写入失败");
   }
 }
 

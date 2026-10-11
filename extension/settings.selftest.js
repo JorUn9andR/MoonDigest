@@ -1,6 +1,5 @@
 // /usr/local/bin/node extension/settings.selftest.js
-// BocSettings' normalizers, every context that reads BocSettings loads settings.js first, and the defaults are
-// written nowhere else.
+// BocSettings' normalizers, and the defaults are written nowhere else (load-order.selftest.js checks the load order).
 const fs = require("fs");
 const path = require("path");
 const vm = require("vm");
@@ -58,7 +57,10 @@ const texts = [S.DEFAULTS.playerAiQuickPrompt, ...S.DEFAULTS.aiPresetPrompts, S.
 for (const t of texts) {
   for (const file of sources) assert.ok(!read(file).includes(t), `${file} writes 「${t}」 itself`);
 }
-for (const name of ["normalizeApiKey", "normalizeDownloadFormat", "normalizePlayerAiQuickPrompt", "normalizeFixedPropertyType", "normalizeFixedPropertyValue", "isFixedPropertyRowEffectivelyEmpty", "normalizeFixedFrontmatterProperties", "normalizeNoteSectionPosition", "normalizeNotePlaceholderSections", "normalizeReaderTheme"]) {
+assert.deepStrictEqual([...S.normalizeAiPresetPrompts([" a ", "", "a", 5, null, ...Array.from({ length: 20 }, (_, i) => `q${i}`)])].slice(0, 3), ["a", "5", "q0"]);
+assert.strictEqual(S.normalizeAiPresetPrompts(Array.from({ length: 20 }, (_, i) => `q${i}`)).length, S.MAX_PRESET_PROMPTS);
+assert.deepStrictEqual([...S.normalizeAiPresetPrompts("a")], []);
+for (const name of ["normalizeAiPresetPrompts", "normalizeApiKey", "normalizeDownloadFormat", "normalizePlayerAiQuickPrompt", "normalizeFixedPropertyType", "normalizeFixedPropertyValue", "isFixedPropertyRowEffectivelyEmpty", "normalizeFixedFrontmatterProperties", "normalizeNoteSectionPosition", "normalizeNotePlaceholderSections", "normalizeReaderTheme"]) {
   for (const file of sources) assert.ok(!new RegExp(`function ${name}\\(`).test(read(file)), `${file} defines ${name} again`);
 }
 

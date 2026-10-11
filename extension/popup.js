@@ -23,10 +23,11 @@ const el = {
   settingsBtn: document.getElementById("settingsBtn")
 };
 
+const NOT_VIDEO_PAGE = "当前网页不是支持的视频页";
 let latestPayload = null;
 // Set from the tab's URL in init(): a content script that still answers on a non-video page must not re-enable the tools.
 let onVideoPage = true;
-// Only for when get-settings fails. Its downloadFormat ("srt") wins over the page's payload.downloadFormat.
+// Only for when get-settings fails.
 const DEFAULT_SETTINGS = BocSettings.DEFAULTS;
 
 function formatLocalDate(value = Date.now()) {
@@ -75,7 +76,7 @@ function bindEvents() {
   el.downloadBtn.addEventListener("click", async () => {
     const payload = await ensurePayload();
     const settings = await getSettingsFromRuntime();
-    const format = BocSettings.normalizeDownloadFormat(settings?.downloadFormat || payload?.downloadFormat);
+    const format = BocSettings.normalizeDownloadFormat(settings.downloadFormat);
     const content =
       format === "txt" ? payload?.txt || payload?.subtitlePreview || "" : payload?.srt || "";
     if (!content) {
@@ -110,7 +111,7 @@ function bindEvents() {
   el.readingViewBtn?.addEventListener("click", async () => {
     const tab = await getActiveTab();
     if (!isSupportedSubtitlePage(tab?.url || "")) {
-      setStatus("请先打开一个支持的视频页", true);
+      setStatus(NOT_VIDEO_PAGE, true);
       return;
     }
 
@@ -163,26 +164,13 @@ function bindEvents() {
   el.summaryBtn.addEventListener("click", async () => {
     const tab = await getActiveTab();
     if (!isSupportedSubtitlePage(tab?.url || "")) {
-      setStatus("请先打开一个支持的视频页", true);
+      setStatus(NOT_VIDEO_PAGE, true);
       return;
     }
     setStatus("正在打开侧边栏…", false, true);
     setBusy(el.summaryBtn, true, "打开中…");
-    // A video that already has a conversation gets the panel showing that conversation, no new prompt.
-    // A panel already open on another conversation switches to it through the same request the panel reads.
-    if (await hasConversationFor(tab.url)) {
-      try {
-        await chrome.sidePanel.open({ tabId: tab.id });
-        const createdAt = Date.now();
-        await chrome.storage.local.set({ [BocLimits.KEYS.playerAiQuickAction]: { id: `popup-${createdAt}`, tabId: tab.id, prompt: "", createdAt, showSaved: true } });
-        window.setTimeout(() => window.close(), 80);
-      } catch (error) {
-        setBusy(el.summaryBtn, false);
-        setStatus(`打开侧边栏失败：${error?.message || error}`, true);
-      }
-      return;
-    }
-    // Same path as the player AI button: background opens the side panel and queues the one-click prompt.
+    // Same path as the player AI button: background opens the side panel and queues the request; the panel shows the
+    // video's conversation when it has one, else fills the one-click prompt.
     const resp = await sendToRuntime({ type: "player-ai-quick-action", tabId: tab.id, source: "popup" }).catch((error) => ({ ok: false, error: error.message }));
     if (!resp?.ok) {
       setBusy(el.summaryBtn, false);
@@ -209,23 +197,12 @@ async function refreshFromTab() {
   const resp = await sendToContent({ type: "popup-refresh" }).finally(() => setBusy(el.refreshBtn, false));
   el.refreshBtn.classList.toggle("is-error", !resp?.ok);
   if (!resp?.ok) {
-    const errorText = resp?.error || "请在支持的视频页使用";
+    const errorText = resp?.error || NOT_VIDEO_PAGE;
     setStatus(`抓取失败：${errorText}`, true);
     render(resp?.payload || latestPayload, { preserveStatus: true });
     return;
   }
   render(resp?.payload || latestPayload);
-}
-
-// Same video and part as the side panel's own match (doesTabMatchContextUrl).
-async function hasConversationFor(url) {
-  const ref = BocSites.parseRef(url);
-  const key = BocLimits.KEYS.aiConversations;
-  const list = (await chrome.storage.local.get(key).catch(() => ({})))[key];
-  return Boolean(ref) && Array.isArray(list) && list.some((item) => {
-    const other = BocSites.parseRef(item?.contextUrl || item?.contextRef?.url || "");
-    return other?.site === ref.site && other.id === ref.id && (other.part?.index || 1) === (ref.part?.index || 1);
-  });
 }
 
 async function ensurePayload() {
@@ -296,10 +273,12 @@ function render(payload, { preserveStatus = false } = {}) {
 
 // A tool that cannot work is disabled and says why; without a payload yet a video page keeps them usable.
 function syncTools(payload, onVideoPage = true) {
-  const pageReason = onVideoPage ? "" : "当前网页不是支持的视频页";
+  const pageReason = onVideoPage ? "" : NOT_VIDEO_PAGE;
   const contentReason = pageReason || (payload && !payload.markdown ? "还没有读取到视频内容" : "");
   const subtitleReason = pageReason || (payload && !(payload.srt || payload.txt) ? "当前视频没有可下载的字幕" : "");
   setDisabledReason(el.readingViewBtn, pageReason);
+  // A web page has no video to summarize; no AI platform still leaves it usable (the side panel offers 去设置).
+  setDisabledReason(el.summaryBtn, pageReason);
   setDisabledReason(el.copyBtn, contentReason);
   setDisabledReason(el.mdBtn, contentReason);
   setDisabledReason(el.sendBtn, contentReason);

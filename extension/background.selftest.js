@@ -173,8 +173,8 @@ process.on("exit", (code) => {
   // The user is told too, under the reply: no subtitles, or they failed to load.
   const noticesFor = (extra) => [...ctx.buildAiMessages({ context: { isVideoContext: true, title: "T", ...extra }, userPrompt: "q" }).notices];
   assert.deepStrictEqual(noticesFor({}), ["这期视频没有字幕，只根据标题、简介和评论回答"]);
-  assert.deepStrictEqual(noticesFor({ subtitleFailure: "429" }), ["字幕没取到，只根据标题、简介和评论回答"]);
-  assert.deepStrictEqual(noticesFor({ subtitleFailure: "要登录", subtitleNeedLogin: true }), ["没有登录 B站，拿不到字幕，只根据标题、简介和评论回答"]);
+  assert.deepStrictEqual(noticesFor({ subtitleFailure: "429" }), ["字幕抓取失败，只根据标题、简介和评论回答"]);
+  assert.deepStrictEqual(noticesFor({ subtitleFailure: "要登录", subtitleNeedLogin: true }), ["B站要求登录后才提供字幕，只根据标题、简介和评论回答"]);
   assert.deepStrictEqual(noticesFor({ subtitleMarkdown: "字幕" }), [], "with subtitles there is nothing to say");
 
   // A long subtitle is sampled across the whole video and capped; the model and the user are both told.
@@ -334,6 +334,18 @@ process.on("exit", (code) => {
   // A setting past sync's 8 KB per item is named before Chrome refuses it in English: 2700 汉字 fit, 2800 do not.
   const tooLong = (n) => vm.runInContext(`oversizedSyncItem({ tags: "a", aiSystemPrompt: "字".repeat(${n}) })`, ctx);
   assert.deepStrictEqual([tooLong(2700), tooLong(2800)], ["", "aiSystemPrompt"]);
+
+  // 测试连接 on the settings page reports with the words every Obsidian write uses.
+  const E = ctx.BocErrors.TEXT;
+  const probe = async (fetch) => ((ctx.fetch = fetch), ctx.testObsidianConnection("http://127.0.0.1:27123", "k"));
+  const reply = (status, body) => async () => ({ ok: status < 300, status, json: async () => body });
+  assert.strictEqual((await probe(reply(401, null))).error, E.obsidianKey);
+  assert.strictEqual((await probe(reply(403, null))).error, E.obsidianKey);
+  assert.strictEqual((await probe(reply(200, { authenticated: false }))).error, E.obsidianKey);
+  assert.strictEqual((await probe(reply(500, null))).error, "Obsidian 返回 HTTP 500");
+  const down = await probe(async () => { throw new TypeError("Failed to fetch"); });
+  assert.ok(down.error.startsWith(E.obsidianDown) && /证书/.test(down.error), down.error);
+  assert.deepStrictEqual({ ...(await probe(reply(200, { authenticated: true, service: "S" }))) }, { ok: true, service: "S" });
 
   finished = true;
   clearInterval(keepAlive);

@@ -14,7 +14,7 @@ const BOC_VERSION = chrome.runtime.getManifest().version;
 // In 分拣台's viewer the tab is 分拣台 itself: the side panel takes the video by reference, not from the tab.
 const IN_VIEWER = window !== window.top;
 // The subtitle failure B站 gives a logged-out viewer; the side panel and the AI say login is why.
-const SUBTITLE_NEED_LOGIN = "B站要求登录后才能看字幕，请登录 B站后刷新网页";
+const SUBTITLE_NEED_LOGIN = "B站要求登录后才提供字幕，请登录 B站后刷新网页";
 globalThis.__BOC_CONTENT_SCRIPT_LOADED__ = BOC_VERSION;
 const state = {
   fetchRunId: 0,
@@ -1045,7 +1045,7 @@ async function runRefreshClip() {
     const site = currentSite();
     const ref = site?.parseRef(location.href);
     if (!ref) {
-      throw new Error("当前页面不是支持的视频地址，无法抓取字幕。");
+      throw new Error("当前网页不是支持的视频页");
     }
     state.site = ref.site;
     state.videoId = ref.id;
@@ -1440,7 +1440,6 @@ function getPopupPayload() {
     markdown: state.markdown || "",
     srt: state.srt || "",
     txt: state.txt || "",
-    downloadFormat: BocSettings.normalizeDownloadFormat(state.settings?.downloadFormat),
     subtitleOptions
   };
 }
@@ -1484,7 +1483,7 @@ async function sendToObsidian() {
     if (exists) {
       const choice = await confirmOverwriteNote(filepath, { hasAiSection: Boolean(aiSection) });
       if (!choice) {
-        setMessage(aiSection ? "已取消写入 Obsidian，原笔记未被覆盖。" : "笔记已存在，无 AI 问答，未改动。");
+        setMessage("已取消写入 Obsidian，原笔记未被覆盖。");
         return;
       }
       onPage = true;

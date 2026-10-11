@@ -237,6 +237,18 @@ assert.throws(() => t.triageParseCommand('{"new_tags":[', cmdItems, cmdTags, {})
     t.chrome = { storage: { sync: { get: async (d) => d } } };
     assert.strictEqual((await vm.runInContext("TRIAGE_HANDLERS", ctx)["triage-settings-get"]()).thinkingToggle, on, url);
   }
+  // The platform picked in the side panel (aiProviderId from the page) answers; a missing or disabled pick falls back to the
+  // first enabled one, as the side panel does.
+  {
+    t.loadAiProviders = async () => [
+      { id: "off", baseUrl: "https://off.test", model: "o", enabled: false },
+      { id: "a", baseUrl: "https://a.test", model: "ma" },
+      { id: "b", baseUrl: "https://b.test", model: "mb" }
+    ];
+    t.fetch = async (url) => ({ ok: true, json: async () => ({ choices: [{ message: { content: url } }] }) });
+    const host = async (id) => (await t.triageChat([], 100, false, id)).content.split("/")[2];
+    assert.deepStrictEqual([await host("b"), await host(""), await host("gone"), await host("off")], ["b.test", "a.test", "a.test", "a.test"]);
+  }
   t.loadAiProviders = async () => [{ id: "p", baseUrl: "https://ai.test", model: "m" }];
 
   // A request that never settles, even on abort, still ends with the retryable timeout code.
@@ -462,10 +474,19 @@ assert.throws(() => t.triageParseCommand('{"new_tags":[', cmdItems, cmdTags, {})
   routes = { ...baseRoutes(), [subUrl]: http412 };
   await assert.rejects(analyze(), (e) => e.code === "THROTTLED");
   assert.strictEqual("triage_analysis_BVa" in store, false);
-  routes = { ...baseRoutes(), [subUrl]: new Error("network") };
-  assert.strictEqual((await analyze()).source, "meta");
+  // A failed download: judged on the description and comments, and the card says 字幕抓取失败 with the reason.
+  routes = { ...baseRoutes(), [subUrl]: new TypeError("Failed to fetch") };
+  const failedSub = await analyze();
+  assert.deepStrictEqual([failedSub.source, failedSub.subtitleFailure], ["meta", "网络断了"]);
+  assert.strictEqual((await (routes = { ...baseRoutes(), "/x/player/wbi/v2": emptyList }, analyze())).subtitleFailure, undefined, "no subtitles is not a failure");
+  // So does a track list that cannot be read (the player API drops the connection), as on the video page.
+  const listDown = () => ({ ...baseRoutes(), "/x/player/wbi/v2": new TypeError("Failed to fetch"), "/x/player/v2": new TypeError("Failed to fetch") });
+  routes = listDown();
+  const listFailed = await analyze();
+  assert.deepStrictEqual([listFailed.source, listFailed.subtitleFailure], ["meta", "网络断了"]);
 
-  // Notes: throttling or a failed subtitle fetch writes nothing; another video's subtitle is dropped, not cached.
+  // Notes: throttling writes nothing (the caller waits and retries); a failed subtitle download writes the note without
+  // it, saying so like the video page's note; another video's subtitle is dropped, not cached.
   const buildNote = () => t.triageBuildNote("BVa", {});
   routes = { ...baseRoutes(), "/x/player/wbi/v2": { code: -352, message: "风控" }, "/x/player/v2": { code: -352, message: "风控" } };
   await assert.rejects(buildNote(), (e) => e.code === "THROTTLED");
@@ -474,8 +495,12 @@ assert.throws(() => t.triageParseCommand('{"new_tags":[', cmdItems, cmdTags, {})
   await assert.rejects(buildNote(), (e) => e.code === -404 && e.message === "啥都木有" && t.BocSites.isBiliVideoGone(e.code));
   routes = { ...baseRoutes(), "/view/detail": { code: -352, message: "风控" }, "/web-interface/view?": { code: -352, message: "风控" } };
   await assert.rejects(buildNote(), (e) => e.code === "THROTTLED" && !t.BocSites.isBiliVideoGone(e.code));
-  routes = { ...baseRoutes(), [subUrl]: new Error("network") };
-  await assert.rejects(buildNote(), /network/);
+  routes = { ...baseRoutes(), [subUrl]: Object.assign(new Error("HTTP 403"), { status: 403 }) };
+  const noSub = await buildNote();
+  assert.deepStrictEqual([noSub.body.length, noSub.subtitleWarning], [0, "字幕抓取失败：B站请求失败 HTTP 403。"]);
+  assert.ok(noSub.markdown.includes("> 字幕抓取失败（B站请求失败 HTTP 403），以下为简介与热门评论。"), noSub.markdown);
+  routes = listDown();
+  assert.deepStrictEqual([(await buildNote()).body.length, (await buildNote()).subtitleWarning], [0, "字幕抓取失败：网络断了。"]);
   // A subtitle that does not match the video's length is kept with the video page's warning, and is not cached.
   routes = { ...baseRoutes(), [subUrl]: subtitleRaw(400) };
   const keptNote = await buildNote();

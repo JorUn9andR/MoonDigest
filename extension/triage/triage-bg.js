@@ -543,7 +543,7 @@ async function triageAiSettings() {
   };
 }
 
-async function triageAnalyze({ bvid, force, criteria, folder }) {
+async function triageAnalyze({ bvid, force, criteria, folder, aiProviderId }) {
   if (!bvid) throw triageError("缺少 bvid");
   const cacheKey = BocLimits.KEYS.triageAnalysis(bvid);
   if (!force) {
@@ -558,10 +558,9 @@ async function triageAnalyze({ bvid, force, criteria, folder }) {
 
   let source = "meta";
   let subtitle = "";
-  const found = await site.fetchTracks(ref, m, TRIAGE_BILI_IO);
-  // Throttling reaches the page so it backs off; other failures fall back to comments. A subtitle that does not
-  // match the video's length is used with the video page's warning, as everywhere else.
-  const got = await BocSites.loadFirstTrack(site, BocSites.rankTracks(found.tracks), { videoId: bvid, cid: m.cid }, TRIAGE_BILI_IO, m.duration);
+  // Throttling reaches the page so it backs off; a failed track list or download falls back to comments and the card
+  // says 字幕抓取失败 with the reason. A subtitle that does not match the video's length is used with the video page's warning.
+  const got = await BocSites.loadSubtitle(site, ref, m, TRIAGE_BILI_IO);
   if (got.body.length) {
     source = "subtitle";
     subtitle = BocLimits.sampleAiSubtitle(got.body.map((l) => l.content).join("\n")).text;
@@ -569,13 +568,14 @@ async function triageAnalyze({ bvid, force, criteria, folder }) {
   const comments = subtitle ? "" : (await site.fetchComments(ref, m, TRIAGE_BILI_IO, 10).catch(() => [])).map((c, i) => `${i + 1}. ${c.message}`).join("\n");
 
   const ai = await triageAiSettings();
-  const { content, model } = await triageChat(triageBuildMessages(meta, subtitle, comments, criteria, folder), triageMaxTokens("analyze", 1, ai), ai.triageThinking);
+  const { content, model } = await triageChat(triageBuildMessages(meta, subtitle, comments, criteria, folder), triageMaxTokens("analyze", 1, ai), ai.triageThinking, aiProviderId);
   const analysis = {
     bvid,
     status: "done",
     source,
     // Bilibili hides subtitles from a logged-out user; the card says so.
-    ...(source === "meta" && found.needLogin ? { needLogin: true } : {}),
+    ...(source === "meta" && got.bundle.needLogin ? { needLogin: true } : {}),
+    ...(got.failure ? { subtitleFailure: got.failure } : {}),
     ...(got.mismatch ? { subtitleWarning: BocNote.subtitleMismatchWarning(got.mismatch) } : {}),
     ...triageParseLlm(content),
     model,
@@ -609,8 +609,11 @@ const AI_NETWORK_TEXT = "连不上 AI 平台，请检查网络和接口地址";
 const TRIAGE_AI_TIMEOUT_MS = { normal: 120000, thinking: 240000 };
 
 // 非流式 chat/completions，只取 message.content（忽略 reasoning_content）
-async function triageChat(messages, maxTokens, thinking = false) {
-  const provider = (await loadAiProviders()).find((p) => p.enabled !== false);
+// providerId: the platform picked at the top of the side panel, which the pages send as aiProviderId (triage.js sendRaw);
+// unset or no longer enabled, the first enabled one, as in the side panel.
+async function triageChat(messages, maxTokens, thinking = false, providerId = "") {
+  const enabled = (await loadAiProviders()).filter((p) => p.enabled !== false);
+  const provider = enabled.find((p) => p.id === providerId) || enabled[0];
   if (!provider) throw triageError("请先在设置页配置 AI 平台");
   const apiKey = (await loadAiProviderKeys())[provider.id];
   const headers = { "Content-Type": "application/json" };
@@ -655,7 +658,7 @@ async function triageChat(messages, maxTokens, thinking = false) {
   }
 }
 
-async function triageClassifyTitles({ items, criteria, folder }) {
+async function triageClassifyTitles({ items, criteria, folder, aiProviderId }) {
   const list = (Array.isArray(items) ? items : []).filter((it) => it && it.bvid);
   if (!list.length) throw triageError("缺少 items");
   const ai = await triageAiSettings();
@@ -667,7 +670,8 @@ async function triageClassifyTitles({ items, criteria, folder }) {
       { role: "user", content: user }
     ],
     triageMaxTokens("title", list.length, ai),
-    ai.triageThinking
+    ai.triageThinking,
+    aiProviderId
   );
   const parsed = triageParseTitleBatch(content, list);
   const analyzedAt = Date.now();
@@ -684,7 +688,7 @@ async function triageClassifyTitles({ items, criteria, folder }) {
 
 // 协作打标签：只返回提案，不缓存。新建标签至多 maxNewTags 个（收藏夹剩余名额与分拣设置里 AI 新建上限取小）
 // 关注 (follow-bg.js) calls it too, with UP 主 as items (mid in bvid) and its own unit.
-async function triageAiCommand({ instruction, items, tags, maxNewTags = 5, allowRemove = false }, unit = TRIAGE_AI_UNIT) {
+async function triageAiCommand({ instruction, items, tags, maxNewTags = 5, allowRemove = false, aiProviderId }, unit = TRIAGE_AI_UNIT) {
   const text = String(instruction ?? "").trim();
   if (!text) throw triageError("缺少指令");
   const list = (Array.isArray(items) ? items : []).filter((it) => it && it.bvid);
@@ -694,7 +698,8 @@ async function triageAiCommand({ instruction, items, tags, maxNewTags = 5, allow
   const { content } = await triageChat(
     triageBuildCommandMessages({ instruction: text, tags, items: list, ...opts, unit }),
     triageMaxTokens("command", list.length, ai),
-    ai.triageThinking
+    ai.triageThinking,
+    aiProviderId
   );
   return triageParseCommand(content, list, tags, opts);
 }
@@ -707,17 +712,17 @@ async function triageBuildNote(bvid, settings) {
   const ref = { site: "bilibili", id: bvid, part: null, url: "" };
   const meta = await site.fetchMeta(ref, io);
   ref.url = site.canonicalUrl(bvid, meta.pageCount > 1 ? meta.pageIndex : 1);
-  // Tracks are tried in order like on the video page (BocSites.loadFirstTrack). Throttling, or a fetch failure with no
-  // track to use, rejects so no subtitle-less note is written; a subtitle that does not match the video's length is
-  // kept with the video page's warning (subtitleWarning), which the callers show.
-  const bundle = await site.fetchTracks(ref, meta, io);
-  const found = await BocSites.loadFirstTrack(site, BocSites.rankTracks(bundle.tracks || []), { videoId: bvid, cid: meta.cid }, io, meta.duration);
-  if (!found.track && found.error) throw found.error;
-  const { track, body } = found;
-  const subtitleWarning = found.mismatch ? BocNote.subtitleMismatchWarning(found.mismatch) : "";
+  // Tracks are tried in order like on the video page (BocSites.loadSubtitle). Throttling rejects, so the caller waits
+  // and tries again. A failed track list or download writes the note without subtitles, as the video page does: the
+  // note opens with 字幕抓取失败（原因）. subtitleWarning, which the callers show, is the video page's sentence for that
+  // or for a subtitle that does not match the video's length (kept, not cached).
+  const found = await BocSites.loadSubtitle(site, ref, meta, io);
+  const { track, body, bundle } = found;
+  const subtitleFailure = found.failure;
+  const subtitleWarning = found.mismatch ? BocNote.subtitleMismatchWarning(found.mismatch) : subtitleFailure ? `字幕抓取失败：${subtitleFailure}。` : "";
   const hotComments =
     settings.includeHotCommentsInNote || !body.length ? await site.fetchComments(ref, meta, io).catch(() => []) : [];
-  const noteMeta = { ...BocNote.noteMetaOf({ site: "bilibili", videoId: bvid, meta, bundle, track }), hotComments };
+  const noteMeta = { ...BocNote.noteMetaOf({ site: "bilibili", videoId: bvid, meta, bundle, track }), hotComments, subtitleFailure };
   const { aiConversations } = BocLimits.KEYS;
   // 分拣台 notes always summarize the video's P1 (the analysis is per bvid).
   const extrasRef = { site: "bilibili", videoId: bvid, pageIndex: 1 };
@@ -762,14 +767,16 @@ async function triageObsidianCheck() {
   if (!res.ok) throw triageError(`Obsidian 返回 HTTP ${res.status}`, res.status === 404 ? "OBSIDIAN" : "");
 }
 
-// Returns { path, skipped, aiUpdated, title, source }; skipped means the note existed and overwrite was off,
+// Returns { path, skipped, aiUpdated, title, source, subtitleWarning? }; skipped means the note existed and overwrite was off,
 // aiUpdated that its AI 问答 section was rewritten anyway.
 async function triageWriteNote({ bvid, overwrite }) {
   const settings = await getMergedSettings();
   const { baseUrl, apiKey } = triageObsidianConfig(settings);
-  const { meta, noteMeta, body, markdown, path, cover } = await triageBuildNote(bvid, settings);
+  const { meta, noteMeta, body, markdown, path, cover, subtitleWarning } = await triageBuildNote(bvid, settings);
   try {
-    return await triageVaultWrite({ settings, baseUrl, apiKey, meta, noteMeta, body, markdown, path, cover, overwrite });
+    const done = await triageVaultWrite({ settings, baseUrl, apiKey, meta, noteMeta, body, markdown, path, cover, overwrite });
+    // A note written without its subtitle, or with one that may not match, says so in 逐个视频笔记's list.
+    return done.skipped || !subtitleWarning ? done : { ...done, subtitleWarning };
   } catch (e) {
     throw triageObsidianError(e);
   }

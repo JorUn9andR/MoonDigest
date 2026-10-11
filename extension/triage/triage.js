@@ -278,10 +278,21 @@ function send(msg) {
   return sendRaw(msg).then((r) => (BocErrors.action(r.code) === "login" && showLogin(), r));
 }
 const showLogin = () => showBanner("没登录 B站：先在这个浏览器里登录 B站", "去登录", () => openTab("https://passport.bilibili.com/login"), "login");
+// The AI platform picked at the top of the side panel: sidepanel.js keeps it in this extension's localStorage under
+// this key (SELECTED_PROVIDER_KEY there). Every request carries it; the background's AI calls use it (triageChat).
+const AI_PROVIDER_KEY = "boc_ai_selected_provider";
+function aiProviderId() {
+  try {
+    return localStorage.getItem(AI_PROVIDER_KEY) || "";
+  } catch {
+    return "";
+  }
+}
 function sendRaw(msg) {
+  const id = aiProviderId();
   return new Promise((resolve) => {
     try {
-      chrome.runtime.sendMessage(msg, (resp) => {
+      chrome.runtime.sendMessage(id ? { ...msg, aiProviderId: id } : msg, (resp) => {
         const err = chrome.runtime.lastError;
         if (err) resolve({ ok: false, error: err.message });
         else resolve(resp || { ok: false, error: "后台无响应" });
@@ -2095,6 +2106,13 @@ const ACTION_LABEL = { unfav: "已取消收藏", keep: "已保留" };
 const KEEP_TIP = "保留标记只存在 MoonDigest 里，B站收藏夹不变";
 const DONE_TIP = `已保留：${KEEP_TIP}。\n已取消收藏：已从 B站收藏夹移走，最近的操作可按 U 撤销。`;
 
+// What a 细看 judged from, on the card's meta line, in the video page's words: no subtitle (and why), or a subtitle
+// whose time range may not match the video. Nothing for a matching subtitle.
+function basisText(a) {
+  if (a.source !== "meta") return a.subtitleWarning ? esc(a.subtitleWarning.replace(/。$/, "")) : "";
+  if (a.needLogin) return "未登录 B站拿不到字幕，按简介和评论判断";
+  return a.subtitleFailure ? esc(`字幕抓取失败：${a.subtitleFailure}，按简介和评论判断`) : "没有字幕，按简介和评论判断";
+}
 function cardHtml(it, expanded, mark) {
   const b = it.bvid;
   const v = verdictOf(it);
@@ -2114,7 +2132,7 @@ function cardHtml(it, expanded, mark) {
     : `<button type="button" data-act="basket" aria-label="加入待播 (E)" title="加入待播">+ 待播<kbd class="key">E</kbd></button>`;
   const askBtn = `<button type="button" data-act="ask" aria-label="问 AI (Q)">${AI_SPARK}问 AI<kbd class="key">Q</kbd></button>`;
   // The 发布时间 is relative, the date on hover; the rest is text.
-  const meta = [esc(it.upper), it.pubdate && UI.agoHtml(it.pubdate), Number.isFinite(it.play) && esc(`▶ ${fmtCount(it.play)}`), ["", "粗看", "细看"][v.stage], done && a.source === "meta" && (a.needLogin ? "未登录 B站拿不到字幕，按简介和评论判断" : "没有字幕，按简介和评论判断"), esc(seenText(it)), it.invalid && "已失效", it.folders?.length && esc(`收藏夹：${folderNames(it)}`)].filter(Boolean);
+  const meta = [esc(it.upper), it.pubdate && UI.agoHtml(it.pubdate), Number.isFinite(it.play) && esc(`▶ ${fmtCount(it.play)}`), ["", "粗看", "细看"][v.stage], done && basisText(a), esc(seenText(it)), it.invalid && "已失效", it.folders?.length && esc(`收藏夹：${folderNames(it)}`)].filter(Boolean);
   const left = removed && [originHtml(it), it.removedAt && `<span>${esc(leftText(it))}</span>`].filter(Boolean).join("");
 
   const verdict = decision ? "" : verdictBadge(b, v);
@@ -3704,9 +3722,12 @@ async function runWrite(md = false) {
   S.write = { md, mediaId: String(S.mediaId), text: "" };
   const written = [];
   const failed = [];
+  // Notes written without their subtitle (字幕抓取失败) or with one that may not match the video: amber, like any
+  // reminder that does not stop the run (DESIGN.md 琥珀), under the red failures.
+  const warned = [];
   const showFailed = () => {
-    el.writeFailed.innerHTML = failed.map((f) => `<li>${esc(f)}</li>`).join("");
-    el.writeFailed.hidden = !failed.length;
+    el.writeFailed.innerHTML = [...failed.map((f) => `<li>${esc(f)}</li>`), ...warned.map((w) => `<li class="warn">${esc(w)}</li>`)].join("");
+    el.writeFailed.hidden = !failed.length && !warned.length;
   };
   let obsidian = null; // the reply that showed Obsidian itself is unusable
   let indexPath = "";
@@ -3746,7 +3767,10 @@ async function runWrite(md = false) {
     },
     done(s, r) {
       if (s.index) indexPath = r.ok ? r.data?.path || "" : (failed.push(`索引：${r.error}`), "");
-      else if (r.ok) written.push({ ...r.data, bvid: s.it.bvid, oneLiner: oneLiners[s.it.bvid] });
+      else if (r.ok) {
+        written.push({ ...r.data, bvid: s.it.bvid, oneLiner: oneLiners[s.it.bvid] });
+        if (r.data?.subtitleWarning) warned.push(`${s.it.title}：${r.data.subtitleWarning}`), showFailed();
+      }
       else {
         failed.push(`${s.it.title}：${r.error}`);
         showFailed();

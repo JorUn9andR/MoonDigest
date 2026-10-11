@@ -1,5 +1,5 @@
 // node extension/history/history.selftest.js
-// Loads history.js as the page does (after limits, typing, sites, note, download) on a stub DOM.
+// Loads history.js as the page does, after the scripts history.html lists before it, on a stub DOM.
 const fs = require("fs");
 const path = require("path");
 const vm = require("vm");
@@ -22,8 +22,14 @@ const node = (id) =>
     querySelectorAll: () => [],
     addEventListener: (t, f) => ((L[id] ||= {})[t] ||= []).push(f)
   });
-const conv = (key) => ({ id: key, contextKey: key, title: key, createdAt: 1, updatedAt: 1, messages: [{ role: "user", content: "q" }, { role: "assistant", content: "a" }] });
-const store = { boc_ai_conversations_v1: [conv("a"), conv("b")] };
+// Untrusted text (titles, UP names, comments, AI replies, tag names, paths) stays text: no tag of its own, no way out of
+// a quoted attribute.
+const XSS = ["<img src=x onerror=alert(1)>", `"'><script>alert(1)</script>`];
+const assertInert = (html, where) => assert.ok(!/<img src=x|<script|"'>/i.test(html) && /&lt;|&#60;/.test(html), `${where}: ${html}`);
+// Each video's title, link, question and AI answer come from the page or the AI.
+const conv = (key, bad) => ({ id: key, contextKey: key, title: bad, contextUrl: `https://example.com/${bad}`, createdAt: 1, updatedAt: 1, messages: [{ role: "user", content: bad }, { role: "assistant", content: bad }] });
+// A saved context URL with another scheme is never turned into a link.
+const store = { boc_ai_conversations_v1: [conv("a", XSS[0]), { ...conv("b", XSS[1]), contextUrl: "javascript:alert(1)" }] };
 const ctx = vm.createContext({
   console,
   setTimeout,
@@ -37,7 +43,10 @@ const ctx = vm.createContext({
   }
 });
 ctx.globalThis = ctx;
-for (const f of ["limits.js", "typing.js", "sites.js", "note.js", "download.js"]) vm.runInContext(fs.readFileSync(path.join(__dirname, "..", f), "utf8"), ctx);
+// The scripts history.html loads before history.js, read from the page so the test cannot load a different set.
+const scripts = [...fs.readFileSync(path.join(__dirname, "history.html"), "utf8").matchAll(/<script[^>]*src="([^"]+)"/g)].map((m) => path.join(__dirname, m[1]));
+assert.strictEqual(scripts.pop(), path.join(__dirname, "history.js"), "history.js loads last");
+for (const f of scripts) vm.runInContext(fs.readFileSync(f, "utf8"), ctx);
 
 (async () => {
   await vm.runInContext(`(async () => {\n${source}\n})()`, ctx);
@@ -64,6 +73,8 @@ for (const f of ["limits.js", "typing.js", "sites.js", "note.js", "download.js"]
   els.search.value = "";
   fire("input", {});
   await wait(200);
+  assertInert(html, "history list");
+  assert.ok(!/href="javascript:/i.test(html) && /https:\/\/example\.com/.test(html), "only http(s) context URLs become links");
   const sa = els.selectAll;
   const reason = (id) => [els[id].disabled, els[id].title, els[id].attrs["aria-description"]];
   assert.deepStrictEqual([sa.checked, sa.indeterminate], [false, false], "none selected: empty box");

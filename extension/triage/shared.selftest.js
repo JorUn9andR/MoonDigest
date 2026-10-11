@@ -5,11 +5,20 @@ const vm = require("vm");
 const assert = require("assert");
 
 const ctx = vm.createContext({ setTimeout, clearTimeout });
+vm.runInContext(fs.readFileSync(path.join(__dirname, "../errors.js"), "utf8"), ctx);
 vm.runInContext(fs.readFileSync(path.join(__dirname, "../typing.js"), "utf8"), ctx);
 vm.runInContext(fs.readFileSync(path.join(__dirname, "../tag-core.js"), "utf8"), ctx);
 vm.runInContext(fs.readFileSync(path.join(__dirname, "shared.js"), "utf8"), ctx);
 const UI = ctx.TriageUi;
+// 关注 waits B站限流 out for 90 s (DESIGN), in one place: follow-bg.js's queue and follow.js's write and feed waits read it.
+assert.strictEqual(UI.BILI_HOLD_MS, 90000);
+for (const f of ["follow.js", "follow-bg.js"]) assert.ok(/\.BILI_HOLD_MS/.test(fs.readFileSync(path.join(__dirname, f), "utf8")) && !/WAIT_SEC = 90|backoffMs: 90000/.test(fs.readFileSync(path.join(__dirname, f), "utf8")), f);
+const TAG = ctx.BocTagCore;
 const plain = (v) => JSON.parse(JSON.stringify(v));
+// Untrusted text (titles, UP names, comments, AI replies, tag names, paths) stays text: no tag of its own, no way out of
+// a quoted attribute.
+const XSS = ["<img src=x onerror=alert(1)>", `"'><script>alert(1)</script>`];
+const assertInert = (html, where) => assert.ok(!/<img src=x|<script|"'>/i.test(html) && /&lt;|&#60;/.test(html), `${where}: ${html}`);
 
 // Headroom: reading down past the header folds it; any step back up, the top, or focus in the header unfolds it.
 {
@@ -69,6 +78,14 @@ assert.deepStrictEqual([123456, 100000, 9999, 250000000, 150000].map(UI.fmtCount
 assert.deepStrictEqual([0, 65, 587, 75 * 60, 3600, 3605, 59.9].map(UI.fmtDuration), ["0:00", "1:05", "9:47", "1:15:00", "1:00:00", "1:00:05", "0:59"]);
 assert.strictEqual(UI.fmtDate(0), "");
 assert.strictEqual(UI.fmtDate(new Date(2026, 0, 5, 12).getTime() / 1000), "2026-01-05");
+{
+  const now = 1_800_000_000;
+  const ago = (d) => now - d * 86400;
+  assert.strictEqual(UI.fmtAgo(now - 100, now), "今天");
+  assert.strictEqual(UI.fmtAgo(ago(3), now), "3 天前");
+  assert.strictEqual(UI.fmtAgo(ago(65), now), "2 个月前");
+  assert.strictEqual(UI.fmtAgo(ago(800), now), "2 年前");
+}
 assert.strictEqual(UI.img("//i0.hdslb.com/a.jpg", "48w_48h_1c"), "https://i0.hdslb.com/a.jpg@48w_48h_1c.webp");
 assert.strictEqual(UI.img("https://i0.hdslb.com/a.jpg@1c.webp", "48w"), "https://i0.hdslb.com/a.jpg@1c.webp", "a sized URL stays");
 
@@ -226,13 +243,13 @@ for (const [file, fns] of [["triage.js", ["mergeAiBatch", "aiChanges"]], ["follo
 
 // Tags: a new tag takes the first free color, so deleting a tag frees its color (counting would reuse a taken one).
 {
-  const C = UI.TAG_COLORS;
+  const C = TAG.TAG_COLORS;
   assert.strictEqual(UI.nextTagColor([]), C[0]);
   assert.strictEqual(UI.nextTagColor([{ color: C[0] }, { color: C[2] }]), C[1], "a deleted tag's color is reused, not a taken one");
   assert.strictEqual(UI.nextTagColor(C.map((color) => ({ color }))), C[0], "all taken: round again");
-  assert.strictEqual(UI.cycleTagColor(C[0]), C[1]);
-  assert.strictEqual(UI.cycleTagColor(C.at(-1)), C[0]);
-  assert.strictEqual(UI.cycleTagColor("#000"), C[0], "a color from elsewhere starts the palette");
+  assert.strictEqual(TAG.cycleTagColor(C[0]), C[1]);
+  assert.strictEqual(TAG.cycleTagColor(C.at(-1)), C[0]);
+  assert.strictEqual(TAG.cycleTagColor("#000"), C[0], "a color from elsewhere starts the palette");
   assert.strictEqual(UI.tagNameError("", []), "标签名不能为空");
   assert.strictEqual(UI.tagNameError("a", [{ name: "a" }]), "已有同名标签");
   assert.strictEqual(UI.tagNameError("a", [{ name: "b" }]), "");
@@ -257,12 +274,12 @@ for (const [file, fns] of [["triage.js", ["mergeAiBatch", "aiChanges"]], ["follo
 // 标签管理 edits and deletes, one implementation for both modes: a cleared rule drops the field (关注 used to keep ""),
 // names are cleaned and checked, the color cycles; a deleted tag leaves every item, and an item left bare drops out.
 {
-  const t0 = { id: "a", name: "甲", color: UI.TAG_COLORS[0], rule: "旧说明" };
-  assert.deepStrictEqual(plain(UI.editedTag(t0, "rule", "  ").tag), { id: "a", name: "甲", color: UI.TAG_COLORS[0] });
+  const t0 = { id: "a", name: "甲", color: TAG.TAG_COLORS[0], rule: "旧说明" };
+  assert.deepStrictEqual(plain(UI.editedTag(t0, "rule", "  ").tag), { id: "a", name: "甲", color: TAG.TAG_COLORS[0] });
   assert.strictEqual(UI.editedTag(t0, "rule", ` ${"讲".repeat(90)} `).tag.rule.length, 80);
   assert.strictEqual(UI.editedTag(t0, "name", " 乙, ", []).tag.name, "乙");
   assert.deepStrictEqual(plain(UI.editedTag(t0, "name", "乙", [{ name: "乙" }])), { why: "已有同名标签" });
-  assert.strictEqual(UI.editedTag(t0, "color").tag.color, UI.TAG_COLORS[1]);
+  assert.strictEqual(UI.editedTag(t0, "color").tag.color, TAG.TAG_COLORS[1]);
   assert.strictEqual(t0.rule, "旧说明", "the tag itself is not changed");
   assert.deepStrictEqual([...UI.undoAsk("tags", 3, "UP 主")], ["撤销批量改标签？", "<p>上一步改了 3 个 UP 主的标签，撤销后都改回去。</p>", "撤销"]);
   assert.deepStrictEqual(plain(UI.withoutTag({ x: ["a", "b"], y: ["a"] }, "a")), { x: ["b"] });
@@ -482,12 +499,19 @@ for (const [file, fns] of [["triage.js", ["mergeAiBatch", "aiChanges"]], ["follo
   assert.strictEqual(nodes.transferTarget.L.change.length, 1, "bound once");
   // ✦ AI 打标签's pill: 第 N/M 批 with a bar; the AI 429 wait is amber with its countdown and no bar.
   {
-    const a = { done: 1, total: 4, until: 0, label: "" };
+    const a = { done: 1, total: 4 };
     assert.deepStrictEqual(plain(UI.aiActivity(a)), { text: "AI 打标签 第 2/4 批", done: 1, total: 4 });
-    const w = plain(UI.aiActivity({ ...a, until: 61000, label: "AI 平台限流卡住" }, "（稍后）", 1000));
-    assert.ok(w.stuck && !w.total && /^AI 打标签 · AI 平台限流卡住，.+ 后重试（稍后）$/.test(w.text), w.text);
-    assert.strictEqual(UI.aiActivity({ ...a, until: 500, label: "x" }, "", 1000).stuck, undefined, "a past wait is over");
+    const w = plain(UI.aiActivity(a, UI.waitText("AI 平台限流卡住", 60), "（稍后）"));
+    assert.ok(w.stuck && !w.total && w.text === "AI 打标签 · AI 平台限流卡住，1:00 后重试（稍后）", w.text);
+    assert.strictEqual(UI.aiActivity(a, UI.waitText("x", 0)).stuck, undefined, "a past wait is over");
     assert.strictEqual(UI.aiActivity({}).text, "AI 打标签运行中", "before the first batch");
+  }
+  for (const bad of XSS) {
+    assertInert(UI.titleHtml(bad, 2), "titleHtml");
+    assertInert(UI.cardTagChip({ id: bad, name: bad, color: "#fff" }, bad), "cardTagChip");
+    assertInert(UI.tagRowHtml({ id: bad, name: bad, color: "#fff", rule: bad }, { count: 1, who: "视频" }), "tagRowHtml");
+    assertInert(UI.tagPlusBtn('data-x="1"', `给 ${bad} 打 UP 标签`), "tagPlusBtn");
+    assertInert(UI.sideItem({ attrs: "", label: bad }), "sideItem");
   }
   console.log("shared selftest: all passed");
 })().catch((e) => {

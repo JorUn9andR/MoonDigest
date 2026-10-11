@@ -1,21 +1,19 @@
 // Read-only triage marks on Bilibili pages. Videos without triage data get zero DOM changes.
 (() => {
-  // The triage page's fixed AI classes; the ids are also the CSS color classes.
-  const VERDICTS = { keep: "值得留", drop: "可清理", unsure: "拿不准" };
+  const { VERDICTS, verdictOf } = globalThis.BocTagCore;
   const ACTION = { keep: "已保留", unfav: "已取消收藏" };
-  const STAGE = ["", "标题粗看", "字幕细看"];
+  const STAGE = ["视频已失效", "标题粗看", "字幕细看"];
   const BVID_RE = /(?:\/video\/|[?&]bvid=)(BV[0-9A-Za-z]{10})/;
 
   function bvidFromHref(href) {
     return BVID_RE.exec(String(href || ""))?.[1] || "";
   }
 
-  // Same rules as verdictOf in triage/triage.js: stage-2 analysis (unknown = 拿不准) > stage-1 title result.
-  function badgeInfo({ title, analysis, tagIds, tags, decision } = {}) {
+  // The verdict is BocTagCore.verdictOf, as on the triage page; invalid: the folder's snapshot lists the video as 已失效.
+  function badgeInfo({ title, analysis, invalid, tagIds, tags, decision } = {}) {
     const done = analysis?.status === "done";
-    let v = null;
-    if (done) v = { verdict: VERDICTS[analysis.verdict] ? analysis.verdict : "unsure", reason: analysis.reason, stage: 2 };
-    else if (VERDICTS[title?.verdict]) v = { verdict: title.verdict, reason: title.reason, stage: 1, low: title.confidence === "low" };
+    const found = verdictOf({ title, analysis, invalid });
+    const v = found.verdict === "none" ? null : found;
     const name = v && VERDICTS[v.verdict];
     const byId = new Map((Array.isArray(tags) ? tags : []).map((t) => [t.id, t]));
     const userTags = (Array.isArray(tagIds) ? tagIds : [])
@@ -213,7 +211,7 @@
   const biliSaysSeen = (a) => [...a.querySelectorAll(".bili-cover-card__stat")].some((n) => n.textContent.trim() === "已看完");
 
   globalThis.BocBadges = {
-    bvidFromHref, badgeInfo, mergeDecisions, midFromHref, upTagsOf, firstText, spotIn, upCounts, upHidden,
+    bvidFromHref, badgeInfo, mergeDecisions, midFromHref, upTagsOf, spotIn, upCounts, upHidden,
     faceKey, whoIndex, resolveMid, pickRows, applyUpTag, saveUpTag, SURFACES, surfaceOf, fitCount, biliSaysSeen, lineParts
   };
   if (typeof chrome === "undefined" || !chrome.storage?.local || typeof document === "undefined") return;
@@ -233,14 +231,14 @@
   // Off by default: the AI's verdicts are for the 分拣台; on B站 pages only for those who ask.
   const VERDICT_SETTING = "showBiliVerdicts";
   // 观看进度 on covers has its own setting (设置页「观看进度」, off by default); it or the triage marks turn the page scan on.
-  const SEEN_DEFAULTS = { seenShow: "off", seenThreshold: 80, seenStyle: "badge" };
+  const { SEEN_DEFAULTS, seenConfig, seenWords } = globalThis.BocSurfaces;
   let triageOn = false;
   let lineOn = { verdict: false, vtags: true }; // the video page's line: the AI 判断 and 视频标签 switches
-  let seenCfg = { on: false, bar: false, mark: false, threshold: 80, style: "badge" };
+  let seenCfg = seenConfig(SEEN_DEFAULTS);
   const seenCache = new Map(); // bvid -> percent | 0
   const SEL = 'a[href*="/video/BV"], a[href*="bvid=BV"]';
   // Keys that every video's info depends on; a per-video title or analysis only redraws that video.
-  const isSharedKey = (k) => k === "triage_tags" || k === "triage_video_tags" || k === "triage_kept" || k.startsWith("triage_decisions_");
+  const isSharedKey = (k) => k === "triage_tags" || k === "triage_video_tags" || k === "triage_kept" || k.startsWith("triage_decisions_") || k.startsWith("triage_snapshot_");
 
   const cache = new Map(); // bvid -> info | null
   let shared = null;
@@ -762,10 +760,13 @@ input { box-sizing: border-box; width: 100%; margin: 0; padding: 4px 8px; border
       // getKeys is Chrome 130+; before that only 保留 shows outside a favorites page.
       const all = fid ? [] : (await chrome.storage.local.getKeys?.()) || [];
       const decisionKeys = ["triage_kept", ...(fid ? [`triage_decisions_${fid}`] : all.filter((k) => k.startsWith("triage_decisions_")))];
-      const got = await chrome.storage.local.get(["triage_tags", "triage_video_tags", ...decisionKeys]);
+      // 已失效 comes from the folder's snapshot, so only a favorites page knows it: reading every folder's snapshot (its
+      // whole item list) on every B站 page costs too much, and invalid videos are mostly met in favorites.
+      const snapshot = fid ? `triage_snapshot_${fid}` : "";
+      const got = await chrome.storage.local.get(["triage_tags", "triage_video_tags", ...decisionKeys, ...(snapshot ? [snapshot] : [])]);
       if (g !== gen) return;
       sharedFid = fid;
-      shared = { tags: got.triage_tags, videoTags: got.triage_video_tags || {}, decisions: mergeDecisions(got) };
+      shared = { tags: got.triage_tags, videoTags: got.triage_video_tags || {}, decisions: mergeDecisions(got), invalid: new Set(got[snapshot]?.invalid || []) };
       cache.clear();
     }
     const anchors = findAll(SEL);
@@ -781,6 +782,7 @@ input { box-sizing: border-box; width: 100%; margin: 0; padding: 4px 8px; border
           badgeInfo({
             title: got[`triage_title_${b}`],
             analysis: got[`triage_analysis_${b}`],
+            invalid: shared.invalid.has(b),
             tagIds: shared.videoTags[b],
             tags: shared.tags,
             decision: shared.decisions[b]
@@ -829,8 +831,7 @@ input { box-sizing: border-box; width: 100%; margin: 0; padding: 4px 8px; border
     const box = document.createElement("span");
     box.className = `mdg-seen mdg-seen-${style}`;
     box.dataset.key = key;
-    // 100% reads 看完了, otherwise 看到 N%; ✓ (and the strong look) means it counts as 看完了.
-    const words = known >= 100 ? "✓ 看完了" : seen && !rule.tight ? `✓ 看到 ${known}%` : `看到 ${known}%`;
+    const words = seenWords(known, seen && !rule.tight);
     if (seen || faint) box.append(Object.assign(document.createElement("span"), { className: `mdg-seen-mark${faint ? " mdg-faint" : ""}`, textContent: words }));
     // Bilibili's history and 稍后再看 cards draw this bar themselves.
     if (pct && !host.querySelector(".bili-cover-card__progress")) {
@@ -1096,9 +1097,7 @@ input { box-sizing: border-box; width: 100%; margin: 0; padding: 4px 8px; border
     rules = globalThis.BocSurfaces.rulesWith(v.biliMarksOff, [!verdicts && "verdict", !tags && "vtags"].filter(Boolean));
     triageOn = verdicts || tags;
     const before = seenCfg.on;
-    const bar = v.seenShow === "bar" || v.seenShow === "both";
-    const mark = v.seenShow === "mark" || v.seenShow === "both";
-    seenCfg = { on: bar || mark, bar, mark, threshold: Number(v.seenThreshold) || 80, style: v.seenStyle === "veil" ? "veil" : "badge" };
+    seenCfg = seenConfig(v);
     // Turning it off clears the stored history (triage-bg.js), so a later re-enable starts from a fresh read.
     if (!seenCfg.on) seenCache.clear();
     markBewly();

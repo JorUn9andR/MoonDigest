@@ -2,14 +2,7 @@
 // A plain script loaded before both modules. Everything here returns HTML, text or a comparator; only setActivity,
 // setSync and bindSync touch the elements they are given, and mergeAiBatch fills the proposal it is given.
 (() => {
-  function esc(v) {
-    return String(v ?? "")
-      .replaceAll("&", "&amp;")
-      .replaceAll("<", "&lt;")
-      .replaceAll(">", "&gt;")
-      .replaceAll('"', "&quot;")
-      .replaceAll("'", "&#39;");
-  }
+  const esc = BocErrors.escapeHtml;
   const pad = (n) => String(n).padStart(2, "0");
   // pubdate and friends are seconds since the epoch: 2026-10-08, "" without one.
   function fmtDate(sec) {
@@ -36,7 +29,7 @@
   // 播放量 / 粉丝: 12.3万 and 2.5亿 (one decimal, dropped when 0), plain below 万.
   const fmtCount = (n) => (n >= 1e8 ? `${Math.round(n / 1e7) / 10}亿` : n >= 1e4 ? `${Math.round(n / 1e3) / 10}万` : String(n));
   // Tag names, colors and ids: ../tag-core.js, which badges.js on B站 pages loads too.
-  const { TAG_COLORS, cleanTagName, nextTagColor, cycleTagColor } = globalThis.BocTagCore;
+  const { cleanTagName, nextTagColor, cycleTagColor } = globalThis.BocTagCore;
   // A plain primary click on a video link plays it in the viewer here; with ⌘ / Ctrl / Shift / Alt the browser opens it.
   const plainClick = (e) => e.button === 0 && !e.metaKey && !e.ctrlKey && !e.shiftKey && !e.altKey;
   // A video card plays on a plain click anywhere on it (收藏夹 and 视频投稿 alike), except on a control inside it
@@ -192,10 +185,11 @@
   }
   // 「B站限流卡住，01:30 后重试」 while sec > 0, else "".
   const waitText = (why, sec) => (sec > 0 ? `${why}，${fmtDuration(sec)} 后重试` : "");
-  // A running ✦ AI 打标签's pill, from the run state runAiBatches keeps ({ done, total, until, label }): 第 N/M 批, or
-  // the AI 429 countdown, amber. where names another folder's run.
-  function aiActivity(a, where = "", now = Date.now()) {
-    const wait = waitText(a.label, Math.ceil(((a.until || 0) - now) / 1000));
+  // 关注's wait on B站限流: follow-bg.js's queue pause, and the page's wait before a write or a 视频投稿 page goes again.
+  const BILI_HOLD_MS = 90000;
+  // A running ✦ AI 打标签's pill, from the run state runAiBatches keeps ({ done, total }): 第 N/M 批, or wait (the AI
+  // 429 countdown, MoonTriage.waitOf), amber. where names another folder's run.
+  function aiActivity(a, wait = "", where = "") {
     if (wait) return { text: `AI 打标签 · ${wait}${where}`, stuck: true };
     return a.total ? { text: `AI 打标签 第 ${a.done + 1}/${a.total} 批${where}`, done: a.done, total: a.total } : { text: `AI 打标签运行中${where}` };
   }
@@ -598,5 +592,5 @@
     main.addEventListener("focusin", (e) => e.target.closest(HEAD_ROWS) && set(headroomStep(s, { focus: true })));
   }
 
-  globalThis.TriageUi = { esc, pad, dayText, fmtDate, fmtAgo, agoHtml, setSearchScope, confirmList, pickTitle, fmtDuration, fmtCount, cleanTagName, plainClick, cardPlayClick, cardPickClick, pickCard, img, toCsv, cardTagChip, syncedText, headMeta, titleHtml, ICON, AI_SPARK, byValue, dirWords, sortControl, filterBtn, labeledRow, stateGroup, aiRecentChip, searchBox, bindSearch, resultCount, rowButtons, menuItem, BACKUP_ITEM, reasonAttrs, setReason, WARN_DOT, selectAllState, selectAllBox, toggleAll, setActivity, waitText, aiActivity, syncPill, setSync, bindSync, tagButtons, sideFoot, selbar, askTransfer, sideItem, emptyState, refreshEmpty, noMatch, fillSetRows, clampNumber, clampNumbers, mergeAiBatch, aiChanges, aiProposalOk, previewId, aiTally, TAG_COLORS, nextTagColor, cycleTagColor, tagNameError, deleteTagAsk, editedTag, withoutTag, undoAsk, tagRowHtml, sp, AI_RECENT_RULES, aiRecentUndo, tagPlusBtn, viewerLine, viewerKeyFrom, headroomStep, headroom };
+  globalThis.TriageUi = { esc, pad, dayText, fmtDate, fmtAgo, agoHtml, setSearchScope, confirmList, pickTitle, fmtDuration, fmtCount, cleanTagName, plainClick, cardPlayClick, cardPickClick, pickCard, img, toCsv, cardTagChip, syncedText, headMeta, titleHtml, ICON, AI_SPARK, byValue, dirWords, sortControl, filterBtn, labeledRow, stateGroup, aiRecentChip, searchBox, bindSearch, resultCount, rowButtons, menuItem, BACKUP_ITEM, reasonAttrs, setReason, WARN_DOT, selectAllState, selectAllBox, toggleAll, setActivity, waitText, BILI_HOLD_MS, aiActivity, syncPill, setSync, bindSync, tagButtons, sideFoot, selbar, askTransfer, sideItem, emptyState, refreshEmpty, noMatch, fillSetRows, clampNumber, clampNumbers, mergeAiBatch, aiChanges, aiProposalOk, previewId, aiTally, nextTagColor, tagNameError, deleteTagAsk, editedTag, withoutTag, undoAsk, tagRowHtml, sp, AI_RECENT_RULES, aiRecentUndo, tagPlusBtn, viewerLine, viewerKeyFrom, headroomStep, headroom };
 })();

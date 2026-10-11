@@ -38,8 +38,20 @@ const ctx = vm.createContext({
   }
 });
 ctx.globalThis = ctx;
-for (const f of ["limits.js", "typing.js", "sites.js", "note.js", "download.js"]) vm.runInContext(fs.readFileSync(path.join(__dirname, f), "utf8"), ctx);
-vm.runInContext(`${source}\n;globalThis.peek = () => ({ live: liveContextData, ctx: contextData });`, ctx);
+// The scripts sidepanel.html loads before sidepanel.js, read from the page so the test cannot load a different set.
+const scripts = [...fs.readFileSync(path.join(__dirname, "sidepanel.html"), "utf8").matchAll(/<script[^>]*src="([^"]+)"/g)].map((m) => path.join(__dirname, m[1]));
+assert.strictEqual(scripts.pop(), path.join(__dirname, "sidepanel.js"), "sidepanel.js loads last");
+for (const f of scripts) vm.runInContext(fs.readFileSync(f, "utf8"), ctx);
+vm.runInContext(
+  `${source}\n;globalThis.peek = () => ({ live: liveContextData, ctx: contextData });
+  globalThis.showConversations = (saved) => { savedConversations = saved; currentConversationId = saved[0].id; previousVideoConversationId = saved[1].id; previousVideoExpanded = true; previousVideoBarSignature = ""; };`,
+  ctx
+);
+const realRenderHistoryList = ctx.renderHistoryList;
+// Untrusted text (titles, UP names, comments, AI replies, tag names, paths) stays text: no tag of its own, no way out of
+// a quoted attribute.
+const XSS = ["<img src=x onerror=alert(1)>", `"'><script>alert(1)</script>`];
+const assertInert = (html, where) => assert.ok(!/<img src=x|<script|"'>/i.test(html) && /&lt;|&#60;/.test(html), `${where}: ${html}`);
 for (const f of ["updateContextChip", "renderHistoryList", "restartChat", "renderSuggestions", "renderInitialState", "resetConversationView"]) ctx[f] = () => {};
 ctx.restoreLatestConversationForCurrentContext = async () => {};
 
@@ -131,6 +143,9 @@ const page = (id) => ({ ok: true, payload: { url: `https://example.com/${id}`, t
       if (msg.type === "update-obsidian-ai-section") return { ok: true, exists: updates++ > 0, updated: true };
       return { ok: true };
     };
+    // BocOverwriteDialog.writeBuiltNote sends its own messages.
+    const realRuntimeSend = ctx.chrome.runtime.sendMessage;
+    ctx.chrome.runtime.sendMessage = ctx.sendRuntimeMessage;
     ctx.video = { ...video, pageIndex: 1, title: "T" };
     vm.runInContext('contextData = video; currentConversationMeta = null; chatHistory = [{ role: "user", content: "这个视频" }, { role: "assistant", content: "回答" }]', ctx);
     await ctx.saveCurrentConversationToObsidian();
@@ -139,6 +154,21 @@ const page = (id) => ({ ok: true, payload: { url: `https://example.com/${id}`, t
     const section = sent.filter((m) => m.type === "update-obsidian-ai-section").pop();
     assert.ok(section.filepath === "B站/UP/T.md" && section.section.includes("这个视频") && !section.section.includes("别的视频"), section.section);
     ctx.sendRuntimeMessage = realSend;
+    ctx.chrome.runtime.sendMessage = realRuntimeSend;
+  }
+
+  {
+    // A failed write is red; only not set up or a wrong key (code OBSIDIAN) opens the settings page, not a closed Obsidian.
+    const notices = [];
+    let settings = 0;
+    ctx.showConversationContextNotice = (text, ms, opts) => notices.push([text, opts?.error]);
+    ctx.chrome.runtime.openOptionsPage = () => settings++;
+    const E = ctx.BocErrors;
+    ctx.showObsidianFailure(E.fromResp({ ok: false, error: E.TEXT.obsidianKey, code: "OBSIDIAN" }, "Local API 写入失败"));
+    ctx.showObsidianFailure(E.fromResp({ ok: false, error: "Obsidian 返回 HTTP 500" }, "Local API 写入失败"));
+    ctx.showObsidianFailure(E.fromResp({ ok: false, error: E.TEXT.obsidianDown, code: "OBSIDIAN_DOWN" }, "Local API 写入失败"));
+    assert.deepStrictEqual(notices, [[`写入 Obsidian 失败：${E.TEXT.obsidianKey}`, true], ["写入 Obsidian 失败：Obsidian 返回 HTTP 500", true], [`写入 Obsidian 失败：${E.TEXT.obsidianDown}`, true]]);
+    assert.strictEqual(settings, 1);
   }
 
   {
@@ -224,6 +254,17 @@ const page = (id) => ({ ok: true, payload: { url: `https://example.com/${id}`, t
     };
     assert.deepStrictEqual(errorButtons("AI_QUOTA"), ["去设置", "重试"]);
     assert.deepStrictEqual(errorButtons("AI_NETWORK"), ["重试"]);
+  }
+
+  // Saved conversations: the video's title, the question and the AI's answer, in the history list and 上一个视频.
+  for (const bad of XSS) {
+    const conv = (id) => ({ id, title: bad, contextTitle: bad, updatedAt: 1, messages: [{ role: "user", content: bad }, { role: "assistant", content: bad }] });
+    ctx.showConversations([conv("now"), conv("before")]);
+    const els = vm.runInContext("els", ctx);
+    els.historyList.querySelectorAll = () => [];
+    realRenderHistoryList();
+    assertInert(els.historyList.innerHTML, "history list");
+    assertInert(els.previousVideoBar.innerHTML, "previous video");
   }
 
   console.log("sidepanel selftest: all passed");

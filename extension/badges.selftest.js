@@ -19,6 +19,19 @@ assert.strictEqual(bvidFromHref("https://www.bilibili.com/video/av170001"), "");
 assert.strictEqual(bvidFromHref("https://space.bilibili.com/2773586"), "");
 assert.strictEqual(bvidFromHref(null), "");
 
+// 观看进度: one copy of the defaults, the parsing and the words, in bili-surfaces.js; triage.html loads it before triage.js.
+const B = ctx.BocSurfaces;
+assert.deepStrictEqual(plain(B.seenConfig(B.SEEN_DEFAULTS)), { on: false, bar: false, mark: false, threshold: 80, style: "badge" });
+assert.deepStrictEqual(plain(B.seenConfig({ seenShow: "both", seenThreshold: "90", seenStyle: "veil" })), { on: true, bar: true, mark: true, threshold: 90, style: "veil" });
+assert.deepStrictEqual(plain(B.seenConfig({ seenShow: "mark", seenThreshold: 0, seenStyle: "x" })), { on: true, bar: false, mark: true, threshold: 80, style: "badge" });
+assert.deepStrictEqual([B.seenWords(100, false), B.seenWords(85, true), B.seenWords(40, false)], ["✓ 看完了", "✓ 看到 85%", "看到 40%"]);
+const triageHtml = fs.readFileSync(path.join(__dirname, "triage/triage.html"), "utf8");
+assert.ok(triageHtml.indexOf("../bili-surfaces.js") > -1 && triageHtml.indexOf("../bili-surfaces.js") < triageHtml.indexOf("./triage.js"), "triage.html loads bili-surfaces.js before triage.js");
+for (const f of ["badges.js", "triage/triage.js"]) {
+  const src = fs.readFileSync(path.join(__dirname, f), "utf8");
+  assert.ok(!src.includes('seenShow: "off"') && !src.includes("✓ 看完了") && !/seenShow === "both"/.test(src), `${f} keeps its own 观看进度 defaults or words`);
+}
+
 assert.strictEqual(badgeInfo({}), null, "no data, no mark");
 assert.strictEqual(badgeInfo({ analysis: { status: "error", error: "x" } }), null, "failed analysis alone is not a mark");
 assert.strictEqual(badgeInfo({ tagIds: ["gone"], tags: [] }), null, "dangling tag ids are not a mark");
@@ -68,6 +81,12 @@ assert.strictEqual(badgeInfo({ title: { verdict: "bogus" } }), null, "unknown ve
 
 assert.strictEqual(badgeInfo({ title: { verdict: "t-must", confidence: "high" } }), null, "old custom-tier verdicts are not a mark");
 assert.strictEqual(badgeInfo({ title: { verdict: "unsure" } }).verdict, "unsure");
+// An invalid video is 可清理 like on the triage page, analysed or not.
+assert.deepStrictEqual(
+  [badgeInfo({ invalid: true }).label, badgeInfo({ invalid: true }).aria],
+  ["AI 可清理", "MoonDigest 分拣，AI 判断 可清理（视频已失效）"]
+);
+assert.deepStrictEqual(plain(badgeInfo({ invalid: true, title: { verdict: "keep", reason: "好", confidence: "high" } })).reason, "视频已失效。AI 原理由：好");
 assert.strictEqual(badgeInfo({ analysis: { status: "done", verdict: "t-must" } }).label, "AI 拿不准", "a done 细看 with an old verdict reads as 待定, like the triage page");
 
 // A video decided in several folders shows its latest decision, whatever the storage-key order.
@@ -730,6 +749,13 @@ async function surfacePages() {
   assert.strictEqual((await nickPage(["owner.ups"])).doc.querySelectorAll(".mdg-ups").length, 1, "video page's UP name off: the nickname keeps its tags");
   assert.strictEqual((await nickPage(["nick.ups"])).doc.querySelectorAll(".mdg-ups").length, 0, "the nickname's own cell off: no tags");
   assert.strictEqual(fav.doc.querySelectorAll(".mdg-ups").length, 0, "收藏夹 page: no UP tags");
+
+  // 收藏夹 page with AI 判断 on: a video the folder's snapshot lists as 已失效 shows 可清理, as on the 分拣台.
+  store.triage_snapshot_5 = { invalid: ["BV1GJ411x7h7"] };
+  const card = h("a", { href: "//www.bilibili.com/video/BV1GJ411x7h7", class: "title" }, "已失效视频");
+  const favMarks = await page({ hostname: "space.bilibili.com", pathname: "/9/favlist", search: "?fid=5" }, h("body", {}, h("div", {}, card)), false, { showBiliTriageBadges: true, showBiliVerdicts: true });
+  assert.ok(favMarks.reads.some((k) => [].concat(k).includes("triage_snapshot_5")), "the folder's snapshot is read");
+  assert.deepStrictEqual(favMarks.doc.querySelectorAll(".mdg-v").map((v) => [v.className, v.textContent]), [["mdg-v mdg-drop", "AI 可清理"]]);
 
   // The video page's UP name: its own line under the name row, 「+ UP 标签」 always shown.
   const row = h("div", { class: "up-detail-top" }, h("a", { href: "//space.bilibili.com/1/", class: "up-name" }, " 甲 ", h("span", { class: "mask" })), h("a", { href: "//message.bilibili.com/" }, "发消息"));

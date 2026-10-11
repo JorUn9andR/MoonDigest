@@ -37,13 +37,13 @@ function triageExtractJson(content, open) {
 }
 
 // AI 判断固定三档。模型答 id（不分大小写）或中文名（含改名前的旧名）都认，其他一律算拿不准。
-const TRIAGE_VERDICTS = { keep: "值得留", drop: "可清理", unsure: "拿不准" };
 const TRIAGE_VERDICT_ALIASES = { 留: "keep", 可以删: "drop", 待定: "unsure" };
 function triageVerdict(v) {
   const s = String(v ?? "").trim();
   const id = s.toLowerCase();
-  if (TRIAGE_VERDICTS[id]) return id;
-  return Object.keys(TRIAGE_VERDICTS).find((k) => TRIAGE_VERDICTS[k] === s) || TRIAGE_VERDICT_ALIASES[s] || "unsure";
+  const names = BocTagCore.VERDICTS;
+  if (names[id]) return id;
+  return Object.keys(names).find((k) => names[k] === s) || TRIAGE_VERDICT_ALIASES[s] || "unsure";
 }
 
 // tags 是标签名列表，或 [{ name, rule }]
@@ -285,6 +285,9 @@ async function triageBiliFetch(url, init = {}) {
   }
 }
 
+// What a B站 page's own requests send; from the worker fetch would send no referrer.
+const TRIAGE_BILI_GET = { cache: "no-store", referrer: "https://www.bilibili.com/", referrerPolicy: "strict-origin-when-cross-origin" };
+
 // GET → the whole JSON, whatever its code. url may be an async function (WBI: signed again on every try).
 // Without pace (收藏夹) it is one try; the caller backs off on THROTTLED. pace (关注's long syncs) =
 // { slot, hold, cfg: { strikes, backoffMs, netRetry } }: every try waits for slot(); a dropped connection holds the
@@ -297,7 +300,7 @@ async function triageBiliGetJson(url, pace) {
     await pace?.slot();
     let json = null;
     try {
-      json = await triageBiliJson(await triageBiliFetch(u));
+      json = await triageBiliJson(await triageBiliFetch(u, TRIAGE_BILI_GET));
     } catch (e) {
       if (!pace) throw e;
       if (e.code === "NETWORK" && net < pace.cfg.netRetry.length) {
@@ -333,14 +336,12 @@ async function triageBiliPost(path, fields) {
   return triageBiliData(await triageBiliJson(res));
 }
 
-// The sites.js fetchers through background fetch, with risk control mapped to THROTTLED like triageBiliGet.
-// A player answer without a subtitle object is risk control too.
+// The sites.js fetchers (细看, notes) through the same channel, one try, with risk control mapped to THROTTLED like
+// triageBiliGet. A player answer without a subtitle object is risk control too.
 const TRIAGE_BILI_IO = {
   signWbi: true,
   async fetchJson(url) {
-    const json = await fetchJsonForAi(url).catch((e) => {
-      throw e.status === 412 ? triageError("B站请求失败 HTTP 412", "THROTTLED") : e;
-    });
+    const json = await triageBiliGetJson(url);
     if (BILI_RISK_CODES.has(json?.code)) throw triageError(`B站返回 ${json.code}：${json.message}`, "THROTTLED");
     if (json?.code === 0 && /\/x\/player\//.test(url) && !json.data?.subtitle) throw triageError("B站字幕接口限流，稍后重试", "THROTTLED");
     return json;
@@ -378,7 +379,7 @@ const SEEN_MAX_PAGES = 60;
 const SEEN_KEEP_S = 365 * 86400;
 const SEEN_MAX = 5000;
 const SEEN_PRUNE_GAP_MS = 86400 * 1000;
-const SEEN_META = "triage_seen_meta"; // { newest: view_at s, syncedAt, prunedAt, backoffUntil, resume }
+const SEEN_META = BocLimits.KEYS.triageSeenMeta; // { newest: view_at s, syncedAt, prunedAt, backoffUntil, resume }
 
 // Percent watched from a history item: progress -1 means finished.
 function seenPercent(progress, duration) {
@@ -477,8 +478,8 @@ async function seenSyncOnce(force, started) {
   let dropped = 0;
   if (now - (meta.prunedAt || 0) > SEEN_PRUNE_GAP_MS) {
     const all = (await chrome.storage.local.getKeys()).filter((k) => k.startsWith("seen_"));
-    const got = await chrome.storage.local.get([...all, "triage_included_folders"]);
-    const snaps = await chrome.storage.local.get((got.triage_included_folders || []).map((id) => `triage_snapshot_${id}`));
+    const got = await chrome.storage.local.get([...all, BocLimits.KEYS.triageIncludedFolders]);
+    const snaps = await chrome.storage.local.get((got[BocLimits.KEYS.triageIncludedFolders] || []).map(BocLimits.KEYS.triageSnapshot));
     const keep = new Set(Object.values(snaps).flatMap((s) => s?.bvids || []));
     const drop = seenPrune(Object.fromEntries(all.map((k) => [k.slice(5), got[k]])), keep, Math.floor(now / 1000));
     if (drop.length) await chrome.storage.local.remove(drop.map((b) => `seen_${b}`));
@@ -549,7 +550,7 @@ async function triageAiSettings() {
 
 async function triageAnalyze({ bvid, force, criteria, folder }) {
   if (!bvid) throw triageError("缺少 bvid");
-  const cacheKey = `triage_analysis_${bvid}`;
+  const cacheKey = BocLimits.KEYS.triageAnalysis(bvid);
   if (!force) {
     const cached = (await chrome.storage.local.get(cacheKey))[cacheKey];
     if (cached) return cached;
@@ -686,7 +687,7 @@ async function triageClassifyTitles({ items, criteria, folder }) {
   const toStore = {};
   for (const [bvid, r] of Object.entries(parsed)) {
     results[bvid] = { ...r, criteria: String(criteria ?? "").trim() };
-    if (r.reason !== "AI 未返回") toStore[`triage_title_${bvid}`] = { ...results[bvid], model, analyzedAt };
+    if (r.reason !== "AI 未返回") toStore[BocLimits.KEYS.triageTitle(bvid)] = { ...results[bvid], model, analyzedAt };
   }
   await chrome.storage.local.set(toStore);
   return { results };
@@ -745,15 +746,15 @@ async function triageBuildNote(bvid, settings) {
     pageCount: meta.pageCount,
     pageTitle: meta.pageTitle
   };
-  const cacheKey = `triage_analysis_${bvid}`;
-  const conversationsKey = BocLimits.KEYS.aiConversations;
-  const stored = await chrome.storage.local.get([cacheKey, conversationsKey, "triage_notes", "triage_tags", "triage_video_tags"]);
+  const { aiConversations, triageNotes, triageTags, triageVideoTags } = BocLimits.KEYS;
+  const cacheKey = BocLimits.KEYS.triageAnalysis(bvid);
+  const stored = await chrome.storage.local.get([cacheKey, aiConversations, triageNotes, triageTags, triageVideoTags]);
   const analysis = stored[cacheKey];
   // The user's 分拣 tags, every folder's, go into the note's tags next to the fixed ones from the settings page.
-  const tagNames = new Map((stored.triage_tags || []).map((t) => [t.id, t.name]));
-  noteMeta.userTags = [...new Set((stored.triage_video_tags?.[bvid] || []).map((id) => tagNames.get(id)).filter(Boolean))];
-  noteMeta.aiTurns = BocNote.buildConversationTurns(BocNote.pickConversation(stored[conversationsKey], noteMeta)?.messages);
-  const markdown = BocNote.withTriageSummary(BocNote.buildMarkdown(noteMeta, body, settings, ref), analysis, stored.triage_notes?.[bvid]?.text);
+  const tagNames = new Map((stored[triageTags] || []).map((t) => [t.id, t.name]));
+  noteMeta.userTags = [...new Set((stored[triageVideoTags]?.[bvid] || []).map((id) => tagNames.get(id)).filter(Boolean))];
+  noteMeta.aiTurns = BocNote.buildConversationTurns(BocNote.pickConversation(stored[aiConversations], noteMeta)?.messages);
+  const markdown = BocNote.withTriageSummary(BocNote.buildMarkdown(noteMeta, body, settings, ref), analysis, stored[triageNotes]?.[bvid]?.text);
   // Every writer of this note uses this path and downloads this cover into the vault (hdslb links 403 in Obsidian).
   const folder = BocNote.resolveFolderTemplate(settings.noteFolder, noteMeta);
   const filename = BocNote.buildNoteFilename(noteMeta, settings);
@@ -762,19 +763,19 @@ async function triageBuildNote(bvid, settings) {
   return { meta, noteMeta, body, markdown, filename, path, cover };
 }
 
-// Code OBSIDIAN: Obsidian itself is not usable (off, not set up, closed, wrong key), so every later note fails the same way.
+// Code OBSIDIAN: Obsidian is not usable (off, not set up, wrong key), so every later note fails the same way.
 function triageObsidianConfig(settings) {
   if (!settings.obsidianEnabled) throw triageError("Obsidian 写入未启用", "OBSIDIAN");
   const baseUrl = String(settings.obsidianApiBaseUrl || "").trim();
   const apiKey = String(settings.obsidianApiKey || "").trim();
-  if (!baseUrl || !apiKey) throw triageError("请先在设置页填写 Obsidian Local REST API 地址和 API Key", "OBSIDIAN");
+  if (!baseUrl || !apiKey) throw triageError(BocErrors.TEXT.obsidianUnset, "OBSIDIAN");
   return { baseUrl, apiKey };
 }
-// A failed fetch (closed, plugin off, wrong address), a timeout or 401/403 is Obsidian's; anything else is this note's.
+// A failed fetch (closed, plugin off, wrong address) or a timeout is OBSIDIAN_DOWN, 401/403 OBSIDIAN; anything else is this note's.
 // The words are background.js obsidianFailure's, shared by every Obsidian write path.
 function triageObsidianError(e) {
-  const { error, setup } = obsidianFailure(e);
-  if (setup) return triageError(error, "OBSIDIAN");
+  const { error, code } = obsidianFailure(e);
+  if (code) return triageError(error, code);
   return e?.status ? triageError(error) : e;
 }
 // Before a 逐个视频笔记 run: the settings and one request to the API root (it answers authenticated: false to a wrong key).
@@ -820,15 +821,16 @@ async function triageVaultWrite({ settings, baseUrl, apiKey, meta, noteMeta, bod
 // Notes used to live on basket items; they now belong to the video (triage_notes, bvid → { text, updatedAt }).
 // Copies each basket note once, never over an existing entry; the basket items keep theirs.
 async function triageMigrateNotes() {
-  const stored = await chrome.storage.local.get(["triage_notes_migrated", "triage_basket", "triage_notes"]);
+  const { triageNotes, triageBasket } = BocLimits.KEYS;
+  const stored = await chrome.storage.local.get(["triage_notes_migrated", triageBasket, triageNotes]);
   if (stored.triage_notes_migrated) return;
-  const notes = { ...stored.triage_notes };
-  for (const item of stored.triage_basket || []) {
+  const notes = { ...stored[triageNotes] };
+  for (const item of stored[triageBasket] || []) {
     if (item?.bvid && String(item.note || "").trim() && !String(notes[item.bvid]?.text || "").trim()) {
       notes[item.bvid] = { text: item.note, updatedAt: Date.now() };
     }
   }
-  await chrome.storage.local.set({ triage_notes: notes, triage_notes_migrated: true });
+  await chrome.storage.local.set({ [triageNotes]: notes, triage_notes_migrated: true });
 }
 
 // One triage tab: each holds its own copy of 保留, tags and the rest, so a second one is focused instead of opened.
@@ -922,9 +924,9 @@ const TRIAGE_HANDLERS = {
     return { items, ids, info };
   },
 
-  // Every video id of a folder in one request, no paging; 所有收藏夹 compares it with the cached list.
   "triage-seen-sync": ({ force } = {}) => seenSync({ force: force === true }),
 
+  // Every video id of a folder in one request, no paging; 所有收藏夹 compares it with the cached list.
   "triage-folder-ids": async ({ mediaId }) => {
     if (!mediaId) throw triageError("缺少 mediaId");
     return { bvids: await triageFolderIds(mediaId) };
@@ -941,8 +943,8 @@ const TRIAGE_HANDLERS = {
 
   "triage-analysis-get": async ({ bvids }) => {
     const list = Array.isArray(bvids) ? bvids : [];
-    const stored = await chrome.storage.local.get(list.map((b) => `triage_analysis_${b}`));
-    return Object.fromEntries(list.map((b) => [b, stored[`triage_analysis_${b}`] || null]));
+    const stored = await chrome.storage.local.get(list.map(BocLimits.KEYS.triageAnalysis));
+    return Object.fromEntries(list.map((b) => [b, stored[BocLimits.KEYS.triageAnalysis(b)] || null]));
   },
 
   "triage-analyze": (msg) => triageAnalyze(msg),
@@ -953,8 +955,8 @@ const TRIAGE_HANDLERS = {
 
   "triage-title-get": async ({ bvids }) => {
     const list = Array.isArray(bvids) ? bvids : [];
-    const stored = await chrome.storage.local.get(list.map((b) => `triage_title_${b}`));
-    return Object.fromEntries(list.map((b) => [b, stored[`triage_title_${b}`] || null]));
+    const stored = await chrome.storage.local.get(list.map(BocLimits.KEYS.triageTitle));
+    return Object.fromEntries(list.map((b) => [b, stored[BocLimits.KEYS.triageTitle(b)] || null]));
   },
 
   "triage-unfav": async ({ mediaId, aids }) => {

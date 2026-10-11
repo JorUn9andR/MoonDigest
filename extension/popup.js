@@ -1,3 +1,4 @@
+const { escapeHtml } = BocErrors;
 const el = {
   status: document.getElementById("status"),
   videoCover: document.getElementById("videoCover"),
@@ -23,11 +24,8 @@ const el = {
 };
 
 let latestPayload = null;
-// The side panel's request slot (sidepanel.js, background.js).
-const QUICK_ACTION_STORAGE_KEY = "boc_player_ai_quick_action_v1";
-const DEFAULT_SETTINGS = {
-  downloadFormat: "srt"
-};
+// Only for when get-settings fails. Its downloadFormat ("srt") wins over the page's payload.downloadFormat.
+const DEFAULT_SETTINGS = BocSettings.DEFAULTS;
 
 function formatLocalDate(value = Date.now()) {
   const date = value instanceof Date ? new Date(value.getTime()) : new Date(value);
@@ -76,7 +74,7 @@ function bindEvents() {
   el.downloadBtn.addEventListener("click", async () => {
     const payload = await ensurePayload();
     const settings = await getSettingsFromRuntime();
-    const format = normalizeDownloadFormat(settings?.downloadFormat || payload?.downloadFormat);
+    const format = BocSettings.normalizeDownloadFormat(settings?.downloadFormat || payload?.downloadFormat);
     const content =
       format === "txt" ? payload?.txt || payload?.subtitlePreview || "" : payload?.srt || "";
     if (!content) {
@@ -175,7 +173,7 @@ function bindEvents() {
       try {
         await chrome.sidePanel.open({ tabId: tab.id });
         const createdAt = Date.now();
-        await chrome.storage.local.set({ [QUICK_ACTION_STORAGE_KEY]: { id: `popup-${createdAt}`, tabId: tab.id, prompt: "", createdAt, showSaved: true } });
+        await chrome.storage.local.set({ [BocLimits.KEYS.playerAiQuickAction]: { id: `popup-${createdAt}`, tabId: tab.id, prompt: "", createdAt, showSaved: true } });
         window.setTimeout(() => window.close(), 80);
       } catch (error) {
         setBusy(el.summaryBtn, false);
@@ -354,19 +352,6 @@ function sanitizeFileName(value) {
     .slice(0, 120);
 }
 
-function normalizeDownloadFormat(value) {
-  return value === "txt" ? "txt" : "srt";
-}
-
-function escapeHtml(value) {
-  return String(value)
-    .replaceAll("&", "&amp;")
-    .replaceAll("<", "&lt;")
-    .replaceAll(">", "&gt;")
-    .replaceAll('"', "&quot;")
-    .replaceAll("'", "&#39;");
-}
-
 async function getActiveTab() {
   const tabs = await chrome.tabs.query({ active: true, currentWindow: true });
   return tabs?.[0] || null;
@@ -418,7 +403,7 @@ function isSupportedSubtitlePage(url) {
 async function ensureContentScriptReady(tabId) {
   const resp = await chrome.runtime.sendMessage({ type: "ensure-reader-content", tabId });
   if (!resp?.ok) {
-    throw new Error(resp?.error || "扩展刚刚更新，请刷新网页重试");
+    throw new Error(resp?.error || BocErrors.TEXT.reloaded);
   }
 }
 

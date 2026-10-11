@@ -7,7 +7,10 @@ const vm = require("vm");
 const assert = require("assert");
 
 const ctx = vm.createContext({ URL, URLSearchParams, console });
+vm.runInContext(fs.readFileSync(path.join(__dirname, "errors.js"), "utf8"), ctx);
+vm.runInContext(fs.readFileSync(path.join(__dirname, "settings.js"), "utf8"), ctx);
 vm.runInContext(fs.readFileSync(path.join(__dirname, "sites.js"), "utf8"), ctx);
+vm.runInContext(fs.readFileSync(path.join(__dirname, "tag-core.js"), "utf8"), ctx);
 vm.runInContext(fs.readFileSync(path.join(__dirname, "note.js"), "utf8"), ctx);
 const N = ctx.BocNote;
 const CREATED = "2026-10-02";
@@ -345,6 +348,15 @@ const withAi = N.buildMarkdown({ ...cases.biliSingle.meta, aiTurns: turns }, bod
 assert.strictEqual(withAi, `${plain}\n\n${section}`);
 assert.strictEqual(N.buildMarkdown({ ...cases.biliSingle.meta, aiTurns: turns }, body, { ...baseSettings, includeAiChatInNote: false }, refOf(bili), CREATED), plain);
 
+// The AI context is the note without the player embed (Obsidian's only) and hot comments; the note keeps the embed.
+for (const c of [cases.biliSingle, cases.youtube]) {
+  const note = N.buildMarkdown(c.meta, c.body, { ...c.settings, includeHotCommentsInNote: false }, refOf(c.meta));
+  const ai = N.buildAiContext(c.meta, c.body, { ...c.settings, includeHotCommentsInNote: true }, refOf(c.meta));
+  assert.ok(!ai.includes("## 评论"), "no hot comments");
+  assert.ok(note.includes("<iframe") && !ai.includes("<iframe"), c.meta.title);
+  assert.strictEqual(ai, note.replace(/<iframe[^\n]*\n\n/, ""), "nothing else differs");
+}
+
 // upsert: present → replaced, absent → appended, outside bytes identical, idempotent, empty section leaves the note alone.
 const userNote = "---\ntitle: x\n---\n\n## 字幕\n\n正文  \n\n我的批注\n";
 const appended = N.upsertAiSection(userNote, section);
@@ -408,4 +420,10 @@ assert.strictEqual(
   const md = N.buildAiConversationMarkdown({ context: p2, turns: [], filename: "x.md" });
   assert.ok(md.includes('url: "https://www.bilibili.com/video/BV1GJ411x7h7/?p=2"'), "P2's url points at P2");
 }
+// Untrusted text (titles, UP names, comments, AI replies, tag names, paths) stays text: no tag of its own, no way out of
+// a quoted attribute.
+const XSS = ["<img src=x onerror=alert(1)>", `"'><script>alert(1)</script>`];
+const assertInert = (html, where) => assert.ok(!/<img src=x|<script|"'>/i.test(html) && /&lt;|&#60;/.test(html), `${where}: ${html}`);
+for (const bad of XSS) assertInert(N.renderMarkdown(`${bad}\n\n- **${bad}**\n\n\`${bad}\``), "renderMarkdown");
+assert.ok(N.renderMarkdown("[x](javascript:alert(1))").includes('href="#"'), "only http, mailto and # links");
 console.log("note selftest ok");

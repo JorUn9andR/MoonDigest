@@ -93,7 +93,7 @@ const send = (message) => new Promise((resolve) => onMessageListeners.forEach((f
   assert.deepStrictEqual(log.splice(0), []);
 
   // A refused key is said in words, with setup so the page offers the settings page; no status body reaches the user.
-  assert.deepStrictEqual(await send({ type: "obsidian-note-exists", baseUrl, apiKey: "wrong", filepath }), { ok: false, error: "Obsidian 的 API Key 无效或未授权", setup: true });
+  assert.deepStrictEqual(await send({ type: "obsidian-note-exists", baseUrl, apiKey: "wrong", filepath }), { ok: false, error: "Obsidian 的 API Key 无效或未授权", code: "OBSIDIAN" });
   log.splice(0);
 
   // 2. The user edits around the section; a follow-up answer updates only the marked block.
@@ -126,15 +126,15 @@ const send = (message) => new Promise((resolve) => onMessageListeners.forEach((f
   const snapshot = vault.get(filepath);
   await new Promise((resolve) => server.close(resolve));
   resp = await send({ type: "update-obsidian-ai-section", ...auth, filepath, section: N.buildAiSection([{ prompt: "x", answer: "y" }]), noteKey });
-  assert.deepStrictEqual(resp, { ok: false, error: "连不上 Obsidian，请确认它已打开并启用了 Local REST API", setup: true });
+  assert.deepStrictEqual(resp, { ok: false, error: "连不上 Obsidian，请确认它已打开并启用了 Local REST API", code: "OBSIDIAN_DOWN" });
   assert.strictEqual(vault.get(filepath), snapshot);
   assert.strictEqual(local[ctx.BocLimits.KEYS.obsidianNotePaths][noteKey].path, filepath, "a failed sync keeps the binding for retry");
 
-  // 汇总一篇 (triage-export) goes through the same PUT and words; code OBSIDIAN gives the triage page its 去设置.
+  // 汇总一篇 (triage-export) goes through the same PUT and words; a closed Obsidian is OBSIDIAN_DOWN, which gets no 去设置.
   Object.assign(sync, { obsidianEnabled: true, obsidianApiBaseUrl: baseUrl });
   local.obsidianApiKey = "k";
   resp = await send({ type: "triage-export", filename: "汇总.md", markdown: "# x" });
-  assert.deepStrictEqual(resp, { ok: false, error: "连不上 Obsidian，请确认它已打开并启用了 Local REST API", code: "OBSIDIAN" });
+  assert.deepStrictEqual(resp, { ok: false, error: "连不上 Obsidian，请确认它已打开并启用了 Local REST API", code: "OBSIDIAN_DOWN" });
 
   console.log("obsidian sync selftest ok");
 })().catch((error) => {

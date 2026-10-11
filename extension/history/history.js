@@ -4,6 +4,7 @@ const OWN_TAB = await chrome.tabs.getCurrent();
 
 const KEY = BocLimits.KEYS.aiConversations;
 const NOTE_PATHS_KEY = BocLimits.KEYS.obsidianNotePaths;
+const { triageNotes: NOTES_KEY, triageAnalysisPrefix: ANALYSIS, triageSnapshotPrefix: SNAPSHOT } = BocLimits.KEYS;
 const $ = (id) => document.getElementById(id);
 const els = { list: $("list"), search: $("search"), count: $("count"), selectAll: $("selectAll"), selectAllLabel: $("selectAllLabel"), bulkMd: $("bulkMd"), bulkDelete: $("bulkDelete"), clearAll: $("clearAll"), status: $("status") };
 
@@ -20,7 +21,7 @@ let editing = null; // { id, draft } while a 备注 is open; storage reloads wai
 let reloadPending = false;
 let rendering = false;
 
-const esc = (value) => String(value ?? "").replace(/[&<>"']/g, (ch) => `&#${ch.charCodeAt(0)};`);
+const esc = BocErrors.escapeHtml;
 const formatTime = (value) => new Date(Number(value) || 0).toLocaleString("zh-CN", { hour12: false, year: "numeric", month: "2-digit", day: "2-digit", hour: "2-digit", minute: "2-digit" });
 
 // One entry per video: the side panel's contextKey (site|videoId|cid) is how it ties a conversation to a video.
@@ -99,10 +100,10 @@ async function closeNote() {
   if (text !== (notes[id]?.text || "")) {
     if (text) notes[id] = { text, updatedAt: Date.now() };
     else delete notes[id];
-    const stored = (await chrome.storage.local.get("triage_notes")).triage_notes || {};
+    const stored = (await chrome.storage.local.get(NOTES_KEY))[NOTES_KEY] || {};
     if (text) stored[id] = notes[id];
     else delete stored[id];
-    await chrome.storage.local.set({ triage_notes: stored });
+    await chrome.storage.local.set({ [NOTES_KEY]: stored });
     setStatus(text ? "备注已保存" : "备注已删除");
   }
   if (reloadPending) {
@@ -136,7 +137,8 @@ function render() {
         // A video whose title never arrived falls back to its id; show that as 未获取标题 with the id in the meta line.
         const untitled = g.title === g.context.videoId;
         const label = untitled ? "未获取标题" : g.title;
-        const title = g.context.url ? `<a class="entry-title" href="${esc(g.context.url)}" target="_blank" rel="noopener">${esc(label)}</a>` : `<span class="entry-title">${esc(label)}</span>`;
+        // Only web links: a saved context URL is shown as a link, never as a javascript: or other scheme.
+        const title = /^https?:\/\//i.test(g.context.url || "") ? `<a class="entry-title" href="${esc(g.context.url)}" target="_blank" rel="noopener">${esc(label)}</a>` : `<span class="entry-title">${esc(label)}</span>`;
         const kind = g.convs.length ? (g.convs.length > 1 ? `${g.convs.length} 段对话` : "") : `仅${[g.analysis && "分拣台 AI 总结", g.note && "备注"].filter(Boolean).join("和")}，没有 AI 对话`;
         return `<article class="entry" data-key="${esc(g.key)}">
           <input type="checkbox" data-act="pick" aria-label="选择" ${selected.has(g.key) ? "checked" : ""} />
@@ -202,11 +204,11 @@ async function load() {
   const all = await chrome.storage.local.get(null);
   conversations = (all[KEY] || []).filter((c) => c?.id && Array.isArray(c.messages));
   analyses = {};
-  notes = Object.fromEntries(Object.entries(all.triage_notes || {}).filter(([, n]) => String(n?.text || "").trim()));
+  notes = Object.fromEntries(Object.entries(all[NOTES_KEY] || {}).filter(([, n]) => String(n?.text || "").trim()));
   triageTitles = {};
   for (const [k, v] of Object.entries(all)) {
-    if (k.startsWith("triage_analysis_") && v?.status === "done") analyses[k.slice(16)] = v;
-    else if (k.startsWith("triage_snapshot_")) Object.assign(triageTitles, v?.titles);
+    if (k.startsWith(ANALYSIS) && v?.status === "done") analyses[k.slice(ANALYSIS.length)] = v;
+    else if (k.startsWith(SNAPSHOT)) Object.assign(triageTitles, v?.titles);
   }
   render();
 }
@@ -253,7 +255,7 @@ async function saveToObsidian(group) {
     const baseUrl = String(settings.obsidianApiBaseUrl || "").trim();
     const apiKey = String(settings.obsidianApiKey || "").trim();
     if (!baseUrl || !apiKey) {
-      setStatus("请先在设置页填写 Obsidian Local REST API 地址和 API Key", true);
+      setStatus(BocErrors.TEXT.obsidianUnset, true);
       chrome.runtime.openOptionsPage();
       return;
     }
@@ -263,7 +265,7 @@ async function saveToObsidian(group) {
     const section = newest ? BocNote.buildAiSection(BocNote.buildConversationTurns(newest.messages)) : "";
     if (section && boundPath) {
       const resp = await chrome.runtime.sendMessage({ type: "update-obsidian-ai-section", baseUrl, apiKey, filepath: boundPath, section, noteKey });
-      if (!resp?.ok) throw obsidianError(resp, "Local API 写入失败");
+      if (!resp?.ok) throw BocErrors.fromResp(resp, "Local API 写入失败");
       if (resp.exists !== false) {
         setStatus(`已更新 AI 问答：${boundPath}`);
         return;
@@ -275,25 +277,13 @@ async function saveToObsidian(group) {
     if (!boundPath && group.context.site === "bilibili" && (Number(group.context.pageIndex) || 1) === 1) {
       setStatus("正在生成视频笔记…");
       built = await chrome.runtime.sendMessage({ type: "triage-build-note", bvid: group.context.videoId });
-      if (!built?.ok && !BocSites.isBiliVideoGone(built?.code)) throw new Error(built?.code === 62004 ? "视频审核中，过后再试" : built?.error || "生成视频笔记失败");
+      if (!built?.ok && !BocSites.isBiliVideoGone(built?.code)) throw new Error(BocErrors.text(built, "生成视频笔记失败"));
     }
     if (built?.ok) {
       setStatus("正在写入…");
-      const { path: filepath, cover } = built.data;
-      const exists = await chrome.runtime.sendMessage({ type: "obsidian-note-exists", baseUrl, apiKey, filepath });
-      if (!exists?.ok) throw obsidianError(exists, "Local API 检查失败");
-      const choice = exists.exists ? await BocOverwriteDialog.choose(filepath, { hasAiSection: Boolean(section) }) : "full";
+      const choice = await BocOverwriteDialog.writeBuiltNote({ baseUrl, apiKey, built: built.data, section, noteKey });
       if (!choice) return;
-      const overwrite = choice === "full";
-      if (overwrite) {
-        const written = await chrome.runtime.sendMessage({ type: "write-obsidian-note", baseUrl, apiKey, filepath, content: built.data.markdown, cover, noteKey });
-        if (!written?.ok) throw obsidianError(written, "Local API 写入失败");
-      }
-      if (section) {
-        const resp = await chrome.runtime.sendMessage({ type: "update-obsidian-ai-section", baseUrl, apiKey, filepath, section, noteKey });
-        if (!resp?.ok) throw obsidianError(resp, "Local API 写入失败");
-      }
-      setStatus(overwrite ? `已写入 Obsidian：${filepath}` : `已更新 AI 问答：${filepath}`);
+      setStatus(`${choice === "full" ? "已写入 Obsidian" : "已更新 AI 问答"}：${built.data.path}`);
       return;
     }
     const videoFolder = BocNote.resolveFolderTemplate(settings.noteFolder || "", group.context);
@@ -302,27 +292,22 @@ async function saveToObsidian(group) {
     const note = buildNote(group, sourcePath);
     const filepath = videoFolder ? `${videoFolder}/${note.filename}` : note.filename;
     const exists = await chrome.runtime.sendMessage({ type: "obsidian-note-exists", baseUrl, apiKey, filepath });
-    if (!exists?.ok) throw obsidianError(exists, "Local API 检查失败");
-    if (exists.exists && !confirm(`该笔记已存在，继续会覆盖原内容：${filepath}`)) return;
+    if (!exists?.ok) throw BocErrors.fromResp(exists, "Local API 检查失败");
+    if (exists.exists && !(await BocOverwriteDialog.choose(filepath))) return;
     const written = await chrome.runtime.sendMessage({ type: "write-obsidian-note", baseUrl, apiKey, filepath, content: note.content });
-    if (!written?.ok) throw obsidianError(written, "Local API 写入失败");
+    if (!written?.ok) throw BocErrors.fromResp(written, "Local API 写入失败");
     if (built) setStatus(`已写入 Obsidian：${filepath}（视频已失效，只写了对话）`);
     else setStatus(group.context.videoId ? `已写入 Obsidian：${filepath}（单独的对话笔记）` : `已写入 Obsidian：${filepath}`);
   } catch (error) {
     setStatus(`写入 Obsidian 失败：${error?.message || error}`, true);
-    // Obsidian itself is unusable (closed, wrong address or key): the settings page, as for 未配置.
-    if (error?.setup) chrome.runtime.openOptionsPage();
+    // A wrong key: the settings page, as for 未配置. A closed Obsidian only gets the red line.
+    if (error?.action === "settings") chrome.runtime.openOptionsPage();
   } finally {
     // A declined overwrite returns without a result line; drop the in-progress one.
     if (els.status.textContent.startsWith("正在")) setStatus("");
     writing.delete(group.key);
     render();
   }
-}
-
-// The background's Obsidian failure (already in the user's words); setup: the fix is in the settings page.
-function obsidianError(resp, fallback) {
-  return Object.assign(new Error(resp?.error || fallback), { setup: resp?.setup === true });
 }
 
 els.list.addEventListener("click", (event) => {
@@ -348,7 +333,7 @@ els.list.addEventListener("click", (event) => {
   }
   else if (act === "ask" && group) {
     // The side panel continues the video's latest conversation, the same request triage's 问 AI sends.
-    chrome.storage.local.set({ boc_player_ai_quick_action_v1: { id: `history-${Date.now()}`, tabId: OWN_TAB?.id, prompt: "", contextRef: group.context } });
+    chrome.storage.local.set({ [BocLimits.KEYS.playerAiQuickAction]: { id: `history-${Date.now()}`, tabId: OWN_TAB?.id, prompt: "", contextRef: group.context } });
     setStatus("正在打开侧边栏…");
     chrome.sidePanel.open({ tabId: OWN_TAB?.id }).then(
       () => els.status.textContent === "正在打开侧边栏…" && setStatus(""),
@@ -385,7 +370,7 @@ els.clearAll.addEventListener("click", async () => {
 });
 chrome.storage.onChanged.addListener((changes, area) => {
   // Triage analyses arrive in bursts; one reload per burst.
-  if (area === "local" && Object.keys(changes).some((k) => k === KEY || k === "triage_notes" || k.startsWith("triage_analysis_") || k.startsWith("triage_snapshot_"))) {
+  if (area === "local" && Object.keys(changes).some((k) => k === KEY || k === NOTES_KEY || k.startsWith(ANALYSIS) || k.startsWith(SNAPSHOT))) {
     clearTimeout(reloadTimer);
     reloadTimer = setTimeout(() => (editing ? (reloadPending = true) : load()), 300);
   }

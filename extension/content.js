@@ -4,34 +4,11 @@
 // Bilibili video pages load this in every frame; a subframe only runs it when viewer-frame.js (document_start)
 // marked it as 分拣台's viewer. Bilibili iframes on other sites stay inert.
 if (!globalThis.__BOC_CONTENT_SCRIPT_LOADED__ && (window === window.top || document.documentElement.hasAttribute("data-mdg-viewer"))) {
-const DEFAULT_SETTINGS = {
-  obsidianEnabled: false,
-  noteFolder: "MoonDigest/{{site}}",
-  obsidianApiBaseUrl: "http://127.0.0.1:27123",
-  obsidianApiKey: "",
-  tags: "MoonDigest",
-  downloadFormat: "srt",
-  youtubeSubtitleLang: "auto",
-  includeDateInFilename: true,
-  includeHotCommentsInNote: false,
-  includeCoverInNote: true,
-  includeAiChatInNote: true,
-  enablePlayerAiQuickAction: true,
-  playerAiQuickPrompt: "整理这期视频的内容，输出结构化总结：主题、核心观点、关键细节、结论与可执行启发。",
-  includeTimestampInBody: true,
-  enableDebugLogs: false,
-  readerTheme: "light",
-  readerFontScale: "m",
-  readerLetterSpacing: "normal",
-  readerLineHeight: "tight",
-  readerContentWidth: "medium",
-  readerChapterVisible: true,
-  frontmatterFields: BocNote.DEFAULT_FRONTMATTER_FIELDS,
-  fixedFrontmatterProperties: [],
-  notePlaceholderSections: []
-};
+// Only for when get-settings fails; the background owns the stored settings.
+const DEFAULT_SETTINGS = { ...BocSettings.DEFAULTS, ...BocSettings.LOCAL_DEFAULTS };
 const { formatCompactTimestamp, buildSubtitlePreview, buildSrt, buildTxt, shouldShowHoursInNote } = BocNote;
 const subtitleCache = BocSites.subtitleCache;
+const { escapeHtml } = BocErrors;
 
 const BOC_VERSION = chrome.runtime.getManifest().version;
 // In 分拣台's viewer the tab is 分拣台 itself: the side panel takes the video by reference, not from the tab.
@@ -287,26 +264,6 @@ function hasNativeReaderPlayerLayoutIssue(playerHost = state.readingPlayerHost) 
 
   const wrapRect = wrapNode.getBoundingClientRect();
   return wrapRect.height <= 8 && playerRect.height > 120;
-}
-
-function normalizeReaderTheme(value) {
-  return value === "dark" || value === "paper" ? value : "light";
-}
-
-function normalizeReaderFontScale(value) {
-  return ["xs", "s", "m", "l", "xl"].includes(value) ? value : "m";
-}
-
-function normalizeReaderLetterSpacing(value) {
-  return ["tighter", "tight", "normal", "relaxed", "loose"].includes(value) ? value : "normal";
-}
-
-function normalizeReaderLineHeight(value) {
-  return ["compact", "tight", "normal", "relaxed", "loose"].includes(value) ? value : "tight";
-}
-
-function normalizeReaderContentWidth(value) {
-  return ["compact", "narrow", "medium", "wide", "full"].includes(value) ? value : "medium";
 }
 
 function shouldDebugLog() {
@@ -650,7 +607,7 @@ function bindSettingsWatcher() {
         rebuildDerivedContent();
       });
     }
-    if ((changes[`triage_analysis_${state.videoId}`] || changes.triage_notes) && state.markdown) {
+    if ((changes[BocLimits.KEYS.triageAnalysis(state.videoId)] || changes[BocLimits.KEYS.triageNotes]) && state.markdown) {
       loadTriageExtras().then((extras) => {
         if (runId !== state.fetchRunId) return;
         state.triageExtras = extras;
@@ -1014,7 +971,7 @@ function buildSidepanelContext() {
   let subtitleMarkdown = "";
   try {
     subtitleMarkdown = body.length
-      ? BocNote.buildMarkdown(state, body, { ...settings, includeHotCommentsInNote: false }, currentRef())
+      ? BocNote.buildAiContext(state, body, settings, currentRef())
       : "";
   } catch (e) {
     subtitleMarkdown = "";
@@ -1483,7 +1440,7 @@ function getPopupPayload() {
     markdown: state.markdown || "",
     srt: state.srt || "",
     txt: state.txt || "",
-    downloadFormat: normalizeDownloadFormat(state.settings?.downloadFormat),
+    downloadFormat: BocSettings.normalizeDownloadFormat(state.settings?.downloadFormat),
     subtitleOptions
   };
 }
@@ -1505,7 +1462,7 @@ async function sendToObsidian() {
   const baseUrl = String(state.settings.obsidianApiBaseUrl || "").trim();
   const apiKey = String(state.settings.obsidianApiKey || "").trim();
   if (!baseUrl || !apiKey) {
-    setMessage("请先在设置页填写 Obsidian Local REST API 地址和 API Key。");
+    setMessage(BocErrors.TEXT.obsidianUnset);
     requestOpenOptions();
     return;
   }
@@ -1540,7 +1497,7 @@ async function sendToObsidian() {
       if (choice === "ai") {
         const resp = await sendRuntimeMessage({ type: "update-obsidian-ai-section", baseUrl, apiKey, filepath, section: aiSection, noteKey });
         if (!resp?.ok) {
-          throw obsidianError(resp, "Local API 写入失败");
+          throw BocErrors.fromResp(resp, "Local API 写入失败");
         }
         report(`已更新 AI 问答：${filepath}`, true);
         return;
@@ -1549,19 +1506,14 @@ async function sendToObsidian() {
     await writeNoteByLocalApi(baseUrl, apiKey, filepath, markdown, cover, noteKey);
     report(`已写入 Obsidian：${filepath}`, true);
   } catch (error) {
-    if (isExtensionContextInvalidated(error)) {
-      report("扩展刚刚更新，请刷新网页重试");
+    if (BocErrors.reloaded(error)) {
+      report(BocErrors.TEXT.reloaded);
       return;
     }
     report(`写入 Obsidian 失败：${getErrorMessage(error)}`);
-    // Obsidian itself is unusable (closed, wrong address or key): the settings page, as for 未配置.
-    if (error.setup) requestOpenOptions();
+    // A wrong key: the settings page, as for 未配置. A closed Obsidian only gets the red line.
+    if (error.action === "settings") requestOpenOptions();
   }
-}
-
-// The background's Obsidian failure (already in the user's words); setup: the fix is in the settings page.
-function obsidianError(resp, fallback) {
-  return Object.assign(new Error(toReadableText(resp?.error, fallback)), { setup: resp?.setup === true });
 }
 
 async function checkObsidianNoteExists(baseUrl, apiKey, filepath) {
@@ -1572,7 +1524,7 @@ async function checkObsidianNoteExists(baseUrl, apiKey, filepath) {
     filepath
   });
   if (!resp?.ok) {
-    throw obsidianError(resp, "Local API 检查失败");
+    throw BocErrors.fromResp(resp, "Local API 检查失败");
   }
   return Boolean(resp.exists);
 }
@@ -1588,7 +1540,7 @@ async function writeNoteByLocalApi(baseUrl, apiKey, filepath, content, cover, no
     noteKey
   });
   if (!resp?.ok) {
-    throw obsidianError(resp, "Local API 写入失败");
+    throw BocErrors.fromResp(resp, "Local API 写入失败");
   }
 }
 
@@ -2131,11 +2083,11 @@ function updateReadingTranscriptTailSpacer() {
 }
 
 function hydrateReaderStateFromSettings(settings = state.settings) {
-  state.readingTheme = normalizeReaderTheme(settings?.readerTheme);
-  state.readingFontScale = normalizeReaderFontScale(settings?.readerFontScale);
-  state.readingLetterSpacing = normalizeReaderLetterSpacing(settings?.readerLetterSpacing ?? settings?.readerLineHeight);
-  state.readingLineHeight = normalizeReaderLineHeight(settings?.readerLineHeight);
-  state.readingContentWidth = normalizeReaderContentWidth(settings?.readerContentWidth);
+  state.readingTheme = BocSettings.normalizeReaderTheme(settings?.readerTheme);
+  state.readingFontScale = BocSettings.normalizeReaderFontScale(settings?.readerFontScale);
+  state.readingLetterSpacing = BocSettings.normalizeReaderLetterSpacing(settings?.readerLetterSpacing ?? settings?.readerLineHeight);
+  state.readingLineHeight = BocSettings.normalizeReaderLineHeight(settings?.readerLineHeight);
+  state.readingContentWidth = BocSettings.normalizeReaderContentWidth(settings?.readerContentWidth);
   state.readingChapterVisible = settings?.readerChapterVisible !== undefined ? Boolean(settings.readerChapterVisible) : true;
 }
 
@@ -2363,13 +2315,13 @@ function buildReadingSummaryItems() {
 }
 
 function updateReaderPreferences(next, { persist = true } = {}) {
-  state.readingTheme = normalizeReaderTheme(next.readerTheme ?? state.readingTheme);
-  state.readingFontScale = normalizeReaderFontScale(next.readerFontScale ?? state.readingFontScale);
-  state.readingLetterSpacing = normalizeReaderLetterSpacing(
+  state.readingTheme = BocSettings.normalizeReaderTheme(next.readerTheme ?? state.readingTheme);
+  state.readingFontScale = BocSettings.normalizeReaderFontScale(next.readerFontScale ?? state.readingFontScale);
+  state.readingLetterSpacing = BocSettings.normalizeReaderLetterSpacing(
     next.readerLetterSpacing ?? state.readingLetterSpacing
   );
-  state.readingLineHeight = normalizeReaderLineHeight(next.readerLineHeight ?? state.readingLineHeight);
-  state.readingContentWidth = normalizeReaderContentWidth(next.readerContentWidth ?? state.readingContentWidth);
+  state.readingLineHeight = BocSettings.normalizeReaderLineHeight(next.readerLineHeight ?? state.readingLineHeight);
+  state.readingContentWidth = BocSettings.normalizeReaderContentWidth(next.readerContentWidth ?? state.readingContentWidth);
   state.readingChapterVisible = next.readerChapterVisible !== undefined ? Boolean(next.readerChapterVisible) : state.readingChapterVisible;
   state.settings = {
     ...state.settings,
@@ -4221,7 +4173,7 @@ function toReadableText(value, fallback = "") {
 // A failed fetch in the user's words: B站 risk control (HTTP 412 or its codes) and a dropped connection are named,
 // and no raw English, HTTP status or B站 code is shown. getErrorMessage keeps the raw text for logs and retry checks.
 function fetchErrorText(error) {
-  if (error?.status === 412 || BocSites.BILI_RISK_CODES.has(error?.code)) {
+  if (isBiliRiskError(error)) {
     return "B站限流，请稍后再试";
   }
   if (/failed to fetch|networkerror|load failed/i.test(toReadableText(error?.message, ""))) {
@@ -4258,11 +4210,6 @@ function sendRuntimeMessage(message) {
   });
 }
 
-function isExtensionContextInvalidated(error) {
-  const msg = String(error?.message || "");
-  return msg.includes("Extension context invalidated");
-}
-
 function requestOpenOptions() {
   sendRuntimeMessage({ type: "open-options" })
     .then((resp) => {
@@ -4271,8 +4218,8 @@ function requestOpenOptions() {
       }
     })
     .catch((error) => {
-      if (isExtensionContextInvalidated(error)) {
-        setMessage("扩展刚刚更新，请刷新网页重试");
+      if (BocErrors.reloaded(error)) {
+        setMessage(BocErrors.TEXT.reloaded);
         return;
       }
       setMessage(`打开设置失败：${getErrorMessage(error)}`);
@@ -4323,6 +4270,9 @@ function isStaleRunError(error) {
   return error?.code === "STALE_RUN";
 }
 
+// B站 risk control (HTTP 412 or its codes): retrying at once only digs deeper, so it is never retried.
+const isBiliRiskError = (error) => error?.status === 412 || BocSites.BILI_RISK_CODES.has(error?.code);
+
 async function retryAsync(task, retries = 1, delayMs = 180) {
   let lastError = null;
   for (let attempt = 0; attempt <= retries; attempt += 1) {
@@ -4330,6 +4280,9 @@ async function retryAsync(task, retries = 1, delayMs = 180) {
       return await task();
     } catch (error) {
       lastError = error;
+      if (isBiliRiskError(error)) {
+        throw error;
+      }
       const isNetworkError = isRetryableNetworkError(error);
       const isRetryable = error?.retryable === true;
       if (!isNetworkError && !isRetryable) {
@@ -4517,8 +4470,8 @@ async function fetchJsonInBackground(url) {
     }
     return resp.data;
   } catch (error) {
-    if (isExtensionContextInvalidated(error)) {
-      throw new Error("扩展刚刚更新，请刷新网页重试");
+    if (BocErrors.reloaded(error)) {
+      throw new Error(BocErrors.TEXT.reloaded);
     }
     throw error;
   }
@@ -4543,9 +4496,10 @@ async function loadTriageExtras() {
     return null;
   }
   try {
-    const analysisKey = state.site === "bilibili" && !(Number(state.pageIndex) > 1) ? `triage_analysis_${state.videoId}` : "";
-    const stored = await chrome.storage.local.get([analysisKey, "triage_notes"].filter(Boolean));
-    return { analysis: analysisKey ? stored[analysisKey] : null, note: stored.triage_notes?.[state.videoId]?.text || "" };
+    const notesKey = BocLimits.KEYS.triageNotes;
+    const analysisKey = state.site === "bilibili" && !(Number(state.pageIndex) > 1) ? BocLimits.KEYS.triageAnalysis(state.videoId) : "";
+    const stored = await chrome.storage.local.get([analysisKey, notesKey].filter(Boolean));
+    return { analysis: analysisKey ? stored[analysisKey] : null, note: stored[notesKey]?.[state.videoId]?.text || "" };
   } catch (error) {
     logWarn("[BOC] failed to load triage summary for note export", error);
     return null;
@@ -4586,18 +4540,5 @@ async function refreshDerivedContent() {
   }
   Object.assign(state, { hotComments, aiTurns, triageExtras });
   rebuildDerivedContent();
-}
-
-function normalizeDownloadFormat(value) {
-  return value === "txt" ? "txt" : "srt";
-}
-
-function escapeHtml(value) {
-  return String(value)
-    .replaceAll("&", "&amp;")
-    .replaceAll("<", "&lt;")
-    .replaceAll(">", "&gt;")
-    .replaceAll('"', "&quot;")
-    .replaceAll("'", "&#39;");
 }
 }

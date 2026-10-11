@@ -10,9 +10,10 @@ const pure = source.slice(source.indexOf("// PURE-START"), source.indexOf("// PU
 assert.ok(pure.includes("function followStatus") && !pure.includes("document"), "harness lifts the pure block");
 const ctx = vm.createContext({ setTimeout, clearTimeout });
 // The pure block sorts with shared.js (UI.byValue / UI.dirWords), as the page does.
+vm.runInContext(fs.readFileSync(path.join(__dirname, "../errors.js"), "utf8"), ctx);
 vm.runInContext(fs.readFileSync(path.join(__dirname, "../tag-core.js"), "utf8"), ctx);
 vm.runInContext(fs.readFileSync(path.join(__dirname, "shared.js"), "utf8"), ctx);
-vm.runInContext(`const UI = globalThis.TriageUi;\n${pure}\n;Object.assign(globalThis, { syncFinished, dirLabel, followAiSettings, aiRequests, normDays, settingsProblem, followStatus, withFeedInProgress, lastPostOf, recentTitles, upRow, visibleUps, mergeFeed, feedMatch, sideIds, feedList, feedLeaving, withTags, stepIn, tagsOf, restoreTags, fmtAgo, feedCounts, STATUS, viewRecord, latestBvid, favUpMid, aiBlocked, withAllowRemove, groupsOf, regrouped, groupCalls, groupTargets, groupName, groupMoveLabel });`, ctx);
+vm.runInContext(`const UI = globalThis.TriageUi;\n${pure}\n;Object.assign(globalThis, { syncFinished, dirLabel, followAiSettings, aiRequests, normDays, settingsProblem, followStatus, withFeedInProgress, lastPostOf, recentTitles, upRow, visibleUps, mergeFeed, feedMatch, sideIds, feedList, feedLeaving, withTags, stepIn, tagsOf, restoreTags, feedCounts, STATUS, viewRecord, latestBvid, favUpMid, aiBlocked, withAllowRemove, groupsOf, regrouped, groupCalls, groupTargets, groupName, groupMoveLabel });`, ctx);
 const t = ctx;
 const plain = (v) => JSON.parse(JSON.stringify(v));
 
@@ -222,10 +223,6 @@ const base = () => ({ list: null, last: null, content: {}, people: {}, tags: [],
 }
 
 assert.deepStrictEqual([t.dirLabel("last", "desc"), t.dirLabel("follow", "asc"), t.dirLabel("fans", "desc"), t.dirLabel("fans", "asc")], ["新→旧", "旧→新", "从多到少", "从少到多"]);
-assert.strictEqual(t.fmtAgo(now - 100, now), "今天");
-assert.strictEqual(t.fmtAgo(ago(3), now), "3 天前");
-assert.strictEqual(t.fmtAgo(ago(65), now), "2 个月前");
-assert.strictEqual(t.fmtAgo(ago(800), now), "2 年前");
 
 // ----- tagging from 动态: deferred removal (the picker itself is tag-picker.selftest.js) -----
 {
@@ -280,7 +277,7 @@ assert.strictEqual(t.fmtAgo(ago(800), now), "2 年前");
 // 视频投稿 paging on B站限流: the stuck pill counts down, then loads again by itself; a selection belongs to its tab.
 {
   assert.ok(source.includes('if (r.code === "THROTTLED") waitFeed(f);') && /if \(!f\.hasMore \|\| f\.loading \|\| f\.wait\) return;/.test(source), "限流 waits instead of an error, and nothing loads during the wait");
-  assert.ok(/function waitFeed[\s\S]*?f\.wait = 0;\s*more\(\);/.test(source) && /if \(f\.wait\) \{[\s\S]*?stuck: true/.test(source), "countdown, then retry");
+  assert.ok(/function waitFeed[\s\S]*?T\.waitOut\("follow-feed", \{ ms: UI\.BILI_HOLD_MS[\s\S]*?f\.wait = false;\s*if \(here\(\)\) more\(\);/.test(source) && /if \(f\.wait\) \{[\s\S]*?stuck: true/.test(source), "countdown, then retry");
   assert.ok(/function setTab\(tab\) \{[^}]*if \(tab !== F\.tab\) F\.sel\.clear\(\);/.test(source), "switching UP 主 / 视频投稿 clears the selection");
   // S3: both tabs share #fwList, so the other tab starts at the top.
   assert.ok(/function setTab\(tab\) \{[^}]*E\.list\.scrollTop = 0;\s*render\(\);/.test(source), "switching tabs scrolls to the top");
@@ -292,20 +289,34 @@ assert.ok(/function tagByKey\(\) \{\s*if \(F\.viewing && F\.viewingMid\) return/
 // what went through.
 (async () => {
   const code = source.slice(source.indexOf("const WRITE_GAP_MS"), source.indexOf("async function unfollow("));
-  const env = { F: { sel: new Set(), busyN: [0, 0] }, toasts: [], sent: [], answers: [], stopAfter: Infinity, waits: 0 };
-  const run = new Function("env", `const { F } = env; const nowSec = () => Date.now() / 1000;
+  const env = { F: { sel: new Set(), busyN: [0, 0] }, UI: t.TriageUi, toasts: [], sent: [], answers: [], stopAfter: Infinity, waits: [], jobs: [] };
+  // MoonTriage's waitOut / waitOf (triage.js; triage.selftest.js tests them) stand in: one job's countdown, redrawn by onTick.
+  const slots = {};
+  env.T = {
+    waitOf: (job) => (slots[job] ? t.TriageUi.waitText(slots[job].label, Math.ceil((slots[job].until - env.clock) / 1000)) : ""),
+    async waitOut(job, { ms, label }, keepGoing, onTick) {
+      env.jobs.push([job, ms]);
+      slots[job] = { until: env.clock + ms, label };
+      while (keepGoing() && env.clock < slots[job].until) (onTick(), (env.clock += 1000), await new Promise((r) => setImmediate(r)));
+      delete slots[job];
+      onTick();
+    }
+  };
+  const run = new Function("env", `const { F, UI, T } = env; const nowSec = () => Date.now() / 1000;
     const send = async (c) => (env.sent.push(c.mid), env.answers.shift() || { ok: true });
     const toast = (m) => env.toasts.push(m); const load = async () => {}; const render = () => {}; const renderSel = () => {};
-    const renderSync = () => { if (F.busyUntil) env.waits++; if (env.sent.length >= env.stopAfter) F.busyStop = true; };
+    const renderSync = () => { const w = F.busy && T.waitOf("follow-write"); if (w) env.waits.push(w); if (env.sent.length >= env.stopAfter) F.busyStop = true; };
     const setTimeout = (f) => setImmediate(f); const Date = { now: () => (env.clock += 1000) };
-    ${code}; return { relationRun, WRITE_GAP_MS, WRITE_WAIT_SEC };`);
+    ${code}; return { relationRun, WRITE_GAP_MS };`);
   env.clock = 0;
   const fns = run(env);
   const calls = ["1", "2", "3"].map((mid) => ({ mid }));
   env.answers = [{ ok: true }, { ok: false, code: "THROTTLED" }, { ok: true }, { ok: true }];
   assert.strictEqual(await fns.relationRun(calls, "取消关注"), 3);
   assert.deepStrictEqual(env.sent, ["1", "2", "2", "3"], "the throttled request goes again, then the rest");
-  assert.ok(env.waits > 10, "the pill counts down the wait");
+  assert.ok(env.waits.length > 10, "the pill counts down the wait");
+  assert.strictEqual(env.waits[0], "取消关注中 2/3 · B站限流卡住，1:30 后重试");
+  assert.deepStrictEqual(env.jobs, [["follow-write", 90000]], "关注's own job: it never takes the 收藏夹 pill's slot");
   assert.deepStrictEqual(env.toasts, ["已取消关注 3 个"]);
   // 停止 during the wait: what went through stays, the run says how far it got.
   Object.assign(env, { sent: [], toasts: [], stopAfter: 2, answers: [{ ok: true }, { ok: false, code: "THROTTLED" }] });
@@ -438,7 +449,7 @@ assert.ok(/async setAllowRemove\(on\) \{\s*const next = withAllowRemove\(await a
 
 // The 关注 tab is 视频投稿 (we read only B站's video posts, which B站 itself calls 视频投稿): no page text says 动态.
 // Comments may; B站 page scripts outside triage/ talk about B站's own 动态 page.
-for (const f of ["triage.html", "triage.js", "follow.js", "follow-bg.js", "shared.js", "tag-picker.js", "tag-dialogs.js"]) {
+for (const f of ["triage.html", "triage.js", "triage-core.js", "follow.js", "follow-bg.js", "shared.js", "tag-picker.js", "tag-dialogs.js"]) {
   const text = fs.readFileSync(path.join(__dirname, f), "utf8").replace(/<!--[\s\S]*?-->/g, "").replace(/\/\*[\s\S]*?\*\//g, "").replace(/(^|[^:])\/\/[^\n]*/g, "$1");
   assert.ok(!text.includes("动态"), `${f} still says 动态 to the user`);
 }

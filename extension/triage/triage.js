@@ -3,8 +3,8 @@ if (!globalThis.chrome?.runtime?.id) await import("./dev/mock-chrome.js");
 
 // ---------- constants ----------
 const THROTTLE_MS = globalThis.__TRIAGE_THROTTLE_MS || 10 * 60 * 1000;
-// Error code -> [backoff ms, status label]. AI 429s clear far sooner than B站 risk control.
-const THROTTLES = { THROTTLED: [THROTTLE_MS, "B站限流卡住"], AI_THROTTLED: [60 * 1000, "AI 平台限流卡住"] };
+// Error code -> the wait (waitOut's { ms, label }). AI 429s clear far sooner than B站 risk control.
+const THROTTLES = { THROTTLED: { ms: THROTTLE_MS, label: "B站限流卡住" }, AI_THROTTLED: { ms: 60 * 1000, label: "AI 平台限流卡住" } };
 const SYNC_MIN_GAP_MS = 60 * 1000;
 // Progress tabs: how far a video has been looked at. The AI class is a filter inside a tab, never a tab.
 // 阅览 sits apart after them.
@@ -14,22 +14,24 @@ const STAGES = [
   ["fine", "细看完成"],
   ["done", "处理完成"]
 ];
+// Storage keys. The shared ones come from BocLimits.KEYS; the rest only this page uses.
+const KEYS = BocLimits.KEYS;
 const K = {
   lastFolder: "triage_last_folder",
-  tags: "triage_tags", // [{ id, name, color, folder, rule? }]: folder is the mediaId the tag belongs to; rule is the one line the AI follows
-  folderCriteria: "triage_folder_criteria", // { [mediaId]: 判断标准 }
-  simplified: "triage_simplified_v1",
+  tags: KEYS.triageTags, // [{ id, name, color, folder, rule? }]: folder is the mediaId the tag belongs to; rule is the one line the AI follows
+  folderCriteria: KEYS.triageFolderCriteria, // { [mediaId]: 判断标准 }
+  simplified: KEYS.triageSimplified,
   tagsByFolder: "triage_tags_by_folder_v1",
-  videoTags: "triage_video_tags",
-  basket: "triage_basket",
-  notes: "triage_notes", // { [bvid]: { text, updatedAt } }, shared with the history page and note export
+  videoTags: KEYS.triageVideoTags,
+  basket: KEYS.triageBasket,
+  notes: KEYS.triageNotes,
   decisions: (id) => `triage_decisions_${id}`, // 取消收藏 only: it changes one Bilibili folder
   kept: "triage_kept", // { [bvid]: { action: "keep", at } }: 保留 belongs to the video, so it shows in every folder
   keptMigrated: "triage_kept_v1",
-  removed: "triage_removed", // { [bvid]: { item, at, movedTo?, hidden?, inFolder?: { id, title } | null, from?: [{ id, title, at }] } }: videos that left every folder, kept until the user cleans them
+  removed: KEYS.triageRemoved, // { [bvid]: { item, at, movedTo?, hidden?, inFolder?: { id, title } | null, from?: [{ id, title, at }] } }: videos that left every folder, kept until the user cleans them
   left: "triage_left", // { [bvid]: { [folderId]: { title, at } } }: folders a video left while still in another chosen one; becomes the record's from
-  included: "triage_included_folders", // [mediaId]: the folders the user chose; only these are listed and read
-  snapshot: (id) => `triage_snapshot_${id}`,
+  included: KEYS.triageIncludedFolders, // [mediaId]: the folders the user chose; only these are listed and read
+  snapshot: KEYS.triageSnapshot,
   aiHistory: "triage_ai_command_history",
   readAt: "triage_read_at", // { [mediaId]: ms }: when each folder's list was last read from B站, for 「今天 HH:MM 刷新过」
   sort: "triage_sort", // { [mediaId]: { sort, dir } }: each folder's card order; none = 收藏时间 新→旧
@@ -41,21 +43,14 @@ const REMOVED = "removed"; // the 已出分拣范围 view
 const TOVIEW = "toview"; // 稍后再看, listed by triage-bg as one more folder
 // The fixed AI classes, shown as chips inside 粗看完成 and 细看完成.
 // The ids are the badge color classes too.
-const VERDICTS = { keep: "值得留", drop: "可清理", unsure: "拿不准" };
+const { VERDICTS } = BocTagCore;
 
-// One-time fold of the old schemes (triage_schemes + triage_folder_scheme) into per-folder 判断标准 and one tag list (pure).
-// Each folder seen in triage gets its scheme's criteria (unmapped = the default scheme's) when non-empty; folders never
-// opened in triage start empty. Tags: the default scheme's, plus other schemes' tags some video uses; same name → the
-// first id wins and video tags are remapped to it. Without schemes, the pre-scheme triage_tags and global criteria carry over.
-function simplifyMigration({ schemes, folderScheme, tags, videoTags, criteria, folderIds = [], folderCriteria }) {
-  const list = Array.isArray(schemes) && schemes.length ? schemes : null;
-  const def = list && (list.find((x) => x?.id === "default") || list[0]);
+// One-time fold of the global 判断标准 (sync triageCriteria, released since v1.2.0) into per-folder 判断标准, and a clean
+// tag list (pure). Each folder seen in triage gets the global criteria when non-empty; folders never opened in triage
+// start empty. Tags: same name → the first id wins and video tags are remapped to it.
+function simplifyMigration({ tags, videoTags, criteria, folderIds = [], folderCriteria }) {
   const vt = videoTags || {};
-  const fs = folderScheme || {};
-  const used = new Set(Object.values(vt).flat());
-  const candidates = list
-    ? [...(def.tags || []), ...list.filter((x) => x !== def).flatMap((x) => (x?.tags || []).filter((t) => used.has(t?.id)))]
-    : Array.isArray(tags) ? tags : [];
+  const candidates = Array.isArray(tags) ? tags : [];
   const out = [];
   const remap = {};
   for (const t of candidates) {
@@ -67,10 +62,8 @@ function simplifyMigration({ schemes, folderScheme, tags, videoTags, criteria, f
   }
   const nextVideoTags = Object.fromEntries(Object.entries(vt).map(([b, ids]) => [b, [...new Set(ids.map((id) => remap[id] || id))]]));
   const crit = {};
-  for (const f of new Set([...folderIds.map(String), ...Object.keys(fs)])) {
-    const text = String((list ? (list.find((x) => x?.id === fs[f]) || def).criteria : criteria) || "").trim();
-    if (text) crit[f] = text;
-  }
+  const text = String(criteria || "").trim();
+  if (text) for (const f of new Set(folderIds.map(String))) crit[f] = text;
   return { tags: out, videoTags: nextVideoTags, folderCriteria: { ...crit, ...folderCriteria } };
 }
 
@@ -111,27 +104,8 @@ function tagsByFolderMigration({ tags = [], videoTags = {}, folders = [], fallba
   return { tags: out, videoTags: nextVideoTags };
 }
 
-// A listed video counts as favorited again after our 取消收藏 only when Bilibili's favorite time (seconds) is not older
-// than it: a list fetched before the 取消收藏, or lagging behind it, still holds the video with its old time. No favTime
-// keeps the 取消收藏.
-const refavorited = (it, dec) => (it.favTime || 0) * 1000 >= dec.at;
-
-// 所有收藏夹 (pure): lists = [{ id, items, decisions }] in folder order. A video in several folders appears once with
-// every folder id in .folders. A folder the video was unfavorited from no longer counts unless it was favorited there
-// again since; a video left in no folder is dropped.
-function mergeFolderItems(lists) {
-  const map = new Map();
-  for (const { id, items, decisions: d = {} } of lists) {
-    for (const it of items) {
-      const dec = d[it.bvid];
-      if (dec?.action === "unfav" && !refavorited(it, dec)) continue;
-      const m = map.get(it.bvid);
-      if (m) m.folders.push(id);
-      else map.set(it.bvid, { ...it, folders: [id] });
-    }
-  }
-  return [...map.values()];
-}
+// The stored records' shapes and the export helpers (pure) live in triage-core.js.
+const { refavorited, mergeFolderItems, updateRemoved, moveToRemoved, inferFrom, forgetLeft, keepInvalidInfo, idsChanged, mergeHead, unfavOnly, mdLinkText, safeNoteName, oneLine, mdLink, wikiLink, zipStored } = TriageCore;
 
 // One-time split (pure): 保留 moves out of every triage_decisions_<folder> into one list, the newest per video winning.
 function splitKept(all) {
@@ -147,90 +121,6 @@ function splitKept(all) {
   }
   return { kept, folders };
 }
-
-// 已出分拣范围 (pure): a folder's full new list replaces its old one. A video that left it and is in no other folder's
-// list is recorded with its last known item and where it had been (its trail, then this folder); a video listed again
-// is dropped from the record and this folder from its trail. One that left but is still in another chosen folder only
-// gets this folder on its trail. One still in the folder's id list (ids) only stopped being listed: Bilibili hides a
-// video that became invalid, so it is marked hidden.
-function updateRemoved(removed, left, oldItems, newItems, otherBvids, at, ids, folder) {
-  const next = { ...removed };
-  const trail = { ...left };
-  const now = new Set(newItems.map((it) => it.bvid));
-  const stillThere = new Set(ids || []);
-  for (const b of now) {
-    delete next[b];
-    forgetLeft(trail, b, folder.id);
-  }
-  for (const it of oldItems) {
-    const b = it.bvid;
-    if (now.has(b) || next[b]) continue;
-    if (otherBvids.has(b)) {
-      trail[b] = { ...trail[b], [folder.id]: { title: folder.title, at } };
-      continue;
-    }
-    next[b] = { item: it, at, from: originOf(trail, b, folder, at) };
-    if (stillThere.has(b)) next[b].hidden = true;
-    delete trail[b];
-  }
-  return { removed: next, left: trail };
-}
-// 移动 to a folder outside triage (pure): like updateRemoved for the moved videos, with where they went. From 已出分拣范围
-// itself (from null) the record keeps the origin it had.
-function moveToRemoved(removed, left, items, otherBvids, from, at, movedTo) {
-  const next = { ...removed };
-  const trail = { ...left };
-  for (const it of items) {
-    if (otherBvids.has(it.bvid)) continue;
-    next[it.bvid] = { item: it, at, movedTo, from: from ? originOf(trail, it.bvid, from, at) : removed[it.bvid]?.from };
-    delete trail[it.bvid];
-  }
-  return { removed: next, left: trail };
-}
-// The folders a video left before (its trail), then the one it leaves now.
-function originOf(left, bvid, folder, at) {
-  const before = Object.entries(left[bvid] || {}).filter(([id]) => id !== folder.id).map(([id, e]) => ({ id, title: e.title, at: e.at }));
-  return [...before, { id: folder.id, title: folder.title, at }];
-}
-// Records from before `from` existed: a 取消收藏 done here in folder X is a fact that the video was in X (pure).
-function inferFrom(decisionsByFolder, bvid, titleOf) {
-  const ids = Object.entries(decisionsByFolder).filter(([, d]) => d?.[bvid]?.action === "unfav").map(([id]) => id);
-  return ids.length ? ids.map((id) => ({ id, title: titleOf(id) })) : undefined;
-}
-// Listed in this folder again: it never left it (mutates trail).
-function forgetLeft(trail, bvid, folderId) {
-  if (!trail[bvid]?.[folderId]) return;
-  const { [folderId]: _, ...rest } = trail[bvid];
-  if (Object.keys(rest).length) trail[bvid] = rest;
-  else delete trail[bvid];
-}
-
-// A video that turns invalid comes back as Bilibili's placeholder; keep what was known about it before (pure).
-function keepInvalidInfo(items, oldItems) {
-  const old = new Map((oldItems || []).map((it) => [it.bvid, it]));
-  return items.map((it) => {
-    const o = it.invalid && old.get(it.bvid);
-    return o ? { ...it, title: o.title || it.title, cover: o.cover || it.cover, upper: o.upper || it.upper, upperMid: o.upperMid || it.upperMid, intro: o.intro || it.intro, duration: o.duration || it.duration } : it;
-  });
-}
-
-// 所有收藏夹 (pure): a cached list is stale when the folder's current video ids differ from it as a set.
-function idsChanged(cached, ids) {
-  const have = new Set(cached);
-  const now = new Set(ids);
-  return have.size !== now.size || [...now].some((b) => !have.has(b));
-}
-// 切换收藏夹 (pure): the fetched newest pages, then the cached rest still in the folder's id list. null when an added id
-// is in neither (moved in from deep in the list), so the caller loads the whole folder.
-function mergeHead(head, cachedItems, oldIds, ids) {
-  const now = new Set(ids);
-  const inHead = new Set(head.map((it) => it.bvid));
-  const items = [...head, ...cachedItems.filter((it) => now.has(it.bvid) && !inHead.has(it.bvid))];
-  const got = new Set(items.map((it) => it.bvid));
-  const old = new Set(oldIds);
-  return ids.every((b) => old.has(b) || got.has(b)) ? items : null;
-}
-const unfavOnly = (d) => Object.fromEntries(Object.entries(d).filter(([, v]) => v?.action === "unfav"));
 
 // ---------- state ----------
 const S = {
@@ -261,7 +151,7 @@ const S = {
   sortBy: {}, // triage_sort
   aiRecentFilter: false, // AI 刚打的
   kindFilter: "", // kindOf: "invalid" (已失效) anywhere; "unfav" / "out" in 已出分拣范围 only
-  seenCfg: { on: false, bar: false, mark: false, threshold: 80, style: "badge" }, // 设置页「观看进度 → 封面显示」
+  seenCfg: BocSurfaces.seenConfig(BocSurfaces.SEEN_DEFAULTS), // 设置页「观看进度 → 封面显示」
   seenPct: {}, // bvid → [percent, view_at] from the history, null when it has none
   noteOpen: new Set(), // empty notes the user opened for editing
   settings: {
@@ -287,8 +177,9 @@ const S = {
   stage1: { running: false, stop: false, done: 0, total: 0 },
   stage1Skip: new Set(),
   analyzing: new Set(),
-  // B站 / AI limit waits, one per job ("stage1", "group", "write", "load", "check"): { until, label }. Each job shows
-  // and clears only its own countdown.
+  // Every B站 / AI limit wait of both modes (waitOut), one per job: { until, label, onTick }. 收藏夹's jobs are "stage1",
+  // "group", "unfav", "transfer", "refav", "write", "load", "check" and "ai"; 关注's start with "follow-". Each job
+  // shows and clears only its own countdown.
   waits: {},
   seenRead: { busy: false, pages: 0, until: 0 }, // the background's read of the watch history (triage_seen_meta)
   undo: [], // 收藏夹's steps; a folder switch clears them
@@ -373,7 +264,7 @@ const el = {};
 // ---------- utils ----------
 // Not logged in to B站 (the background's NOT_LOGGED_IN, B站's -101), on a read or a write in either mode: the 去登录 banner.
 function send(msg) {
-  return sendRaw(msg).then((r) => (r.code === "NOT_LOGGED_IN" && showLogin(), r));
+  return sendRaw(msg).then((r) => (BocErrors.action(r.code) === "login" && showLogin(), r));
 }
 const showLogin = () => showBanner("没登录 B站：先在这个浏览器里登录 B站", "去登录", () => openTab("https://passport.bilibili.com/login"), "login");
 function sendRaw(msg) {
@@ -454,7 +345,7 @@ let ownTabId;
 // the same way as the player's AI 总结 button.
 function askAi(it) {
   const contextRef = { site: "bilibili", videoId: it.bvid, title: it.title, author: it.upper, url: videoUrl(it.bvid) };
-  chrome.storage.local.set({ boc_player_ai_quick_action_v1: { id: `triage-${Date.now()}`, tabId: ownTabId, prompt: "", contextRef } });
+  chrome.storage.local.set({ [KEYS.playerAiQuickAction]: { id: `triage-${Date.now()}`, tabId: ownTabId, prompt: "", contextRef } });
   chrome.sidePanel.open({ tabId: ownTabId }).catch((err) => toast(`打开侧边栏失败：${err.message}`, true));
 }
 
@@ -498,9 +389,11 @@ function askConfirm(title, bodyHtml, okText, { danger = false } = {}) {
 }
 
 // kind "ai" marks an AI setup problem; a run that then succeeds clears only that kind, whichever folder it ran in.
+// No btnText: the banner has only its ×.
 function showBanner(text, btnText, onClick, kind = "") {
   el.banner.dataset.kind = kind;
   el.bannerText.textContent = text;
+  el.bannerBtn.hidden = !btnText;
   el.bannerBtn.textContent = btnText;
   el.bannerBtn.setAttribute("aria-label", btnText);
   el.bannerBtn.onclick = onClick;
@@ -516,14 +409,25 @@ const aiEnds = (r) => AI_END_CODES.has(r.code) || /配置 AI|未授权访问/.te
 const AI_TIMEOUT_TRIES = 2;
 const AI_THROTTLE_WAITS = 5;
 const aiGaveUp = () => ({ ok: false, code: "AI_GAVE_UP", error: `AI 平台持续限流，已等待重试 ${AI_THROTTLE_WAITS} 次，已停止` });
+// What a run does with one AI answer r, by the rule above; n = { timeouts, waits } counts in a row and is updated here.
+// ends(r) says which errors end the run (粗看 passes () => true: it stops on any). Returns [step, r]: "ok"; "retry" (the
+// same request at once); "wait" (THROTTLES[r.code], then the same request); "stop" (r may now be AI_GAVE_UP); "item"
+// (only this request failed, the run goes on).
+function aiNext(r, n, ends = aiEnds) {
+  if (!r.ok && r.code === "AI_TIMEOUT" && ++n.timeouts < AI_TIMEOUT_TRIES) return ["retry", r];
+  if (!r.ok && r.code === "AI_THROTTLED" && n.waits++ === AI_THROTTLE_WAITS) r = aiGaveUp();
+  if (!r.ok && THROTTLES[r.code]) return ["wait", r];
+  if (!r.ok && ends(r)) return ["stop", r];
+  n.timeouts = n.waits = 0;
+  return [r.ok ? "ok" : "item", r];
+}
 
 function handleAiError(error, code = "") {
   const text = String(error || "AI 调用失败");
-  const origin = /未授权访问 (https?:\/\/[^\s，]+)/.exec(text)?.[1];
-  if (origin) {
-    // The click is the user gesture permissions.request needs; the service worker cannot ask.
-    showBanner(text, `授权访问 ${origin}`, async () => {
-      if (await chrome.permissions.request({ origins: [`${origin}/*`] }).catch(() => false)) {
+  const access = BocErrors.grantOrigin(text);
+  if (access) {
+    showBanner(text, `授权访问 ${access.origin}`, async () => {
+      if (await access.request()) {
         el.banner.hidden = true;
         toast("已授权，请重试");
       }
@@ -583,22 +487,11 @@ const ownStage1 = () => S.stage1.running && S.stage1.mediaId === String(S.mediaI
 const ownGroup = () => (S.group?.mediaId === String(S.mediaId) ? S.group : null);
 const runWhere = (run) => (run.mediaId === String(S.mediaId) ? "" : `（${folderName(run.mediaId)}）`);
 
-// verdict is keep / drop / unsure, or "none" before 粗分. A done 细看 with an unknown verdict counts as unsure;
-// a 粗分 result with one (left from the old custom tiers) counts as not classified, so 粗分 can run again.
-// An invalid video is 可清理 whatever the AI said, but keeps the AI's reason and step after the 已失效 note.
+// BocTagCore.verdictOf with the failed 细看's error (not for an invalid video, which is 可清理 anyway).
 function verdictOf(it) {
-  const v = aiVerdictOf(it);
-  if (!it.invalid) return v;
-  return { verdict: "drop", reason: v.reason ? `视频已失效。AI 原理由：${v.reason}` : "视频已失效", stage: Math.max(v.stage, 0), failed: "" };
-}
-
-function aiVerdictOf(it) {
   const a = S.analyses[it.bvid];
-  const failed = a?.status === "error" ? a.error || "分析失败" : "";
-  if (a?.status === "done") return { verdict: VERDICTS[a.verdict] ? a.verdict : "unsure", reason: a.reason, stage: 2, failed: "" };
-  const t = S.titleRes[it.bvid];
-  if (t && VERDICTS[t.verdict]) return { verdict: t.verdict, reason: t.reason, stage: 1, low: t.confidence === "low", failed };
-  return { verdict: "none", reason: "", stage: -1, failed };
+  const v = BocTagCore.verdictOf({ title: S.titleRes[it.bvid], analysis: a, invalid: it.invalid });
+  return { ...v, failed: !it.invalid && a?.status === "error" ? a.error || "分析失败" : "" };
 }
 
 // Search covers title, uploader, the AI one-liner and points, the note and tag names; every word must match.
@@ -761,7 +654,7 @@ let modeKeys = null;
 // 关注's 「UP 标签」 line, redrawn with the 「视频标签」 line.
 let viewerHook = null;
 globalThis.MoonTriage = {
-  openViewer, closeViewer, toast, askConfirm, send, store, runAiBatches, viewing: () => S.viewing,
+  openViewer, closeViewer, toast, askConfirm, send, store, runAiBatches, waitOut, waitOf, viewing: () => S.viewing,
   // The playing 收藏夹 video's UP as { mid, name } (mid "" on items saved before it was stored); null in 关注 or with
   // nothing playing.
   viewingUp() {
@@ -805,7 +698,7 @@ async function init() {
   if (sync.triageAiBatchSize != null) S.settings.triageAiBatchSize = sync.triageAiBatchSize;
   syncObsidian(sync);
   setSeenCfg(sync);
-  followSeenMeta(await storeGet("triage_seen_meta"));
+  followSeenMeta(await storeGet(KEYS.triageSeenMeta));
   chrome.storage.onChanged.addListener((changes, area) => {
     if (area === "sync" && changes.obsidianEnabled) syncObsidian({ obsidianEnabled: changes.obsidianEnabled.newValue });
     if (area === "sync" && Object.keys(SEEN_DEFAULTS).some((k) => changes[k])) {
@@ -901,11 +794,9 @@ function followKept(kept) {
 }
 
 // ---------- 观看进度：看完了 ----------
-const SEEN_DEFAULTS = { seenShow: "off", seenThreshold: 80, seenStyle: "badge" };
+const { SEEN_DEFAULTS, seenConfig, seenWords } = BocSurfaces;
 function setSeenCfg(v) {
-  const bar = v.seenShow === "bar" || v.seenShow === "both";
-  const mark = v.seenShow === "mark" || v.seenShow === "both";
-  S.seenCfg = { on: bar || mark, bar, mark, threshold: Number(v.seenThreshold) || 80, style: v.seenStyle === "veil" ? "veil" : "badge" };
+  S.seenCfg = seenConfig(v);
   document.documentElement.dataset.seenStyle = S.seenCfg.style;
   // The background reads only what is new, at most every 10 minutes (triage-seen-sync); its writes come back through followSeen.
   if (S.seenCfg.on) seenSync(false);
@@ -940,7 +831,7 @@ async function loadSeen(token) {
   for (const b of want) S.seenPct[b] = got[`seen_${b}`] || null;
 }
 function followSeen(changes) {
-  if (changes.triage_seen_meta) followSeenMeta(changes.triage_seen_meta.newValue);
+  if (changes[KEYS.triageSeenMeta]) followSeenMeta(changes[KEYS.triageSeenMeta].newValue);
   let hit = false;
   for (const [key, c] of Object.entries(changes)) {
     if (!key.startsWith("seen_")) continue;
@@ -959,8 +850,6 @@ function seenPercentOf(it) {
 }
 // 看完了: the history says at least the set share was watched (only while that mark is shown).
 const isFinished = (it) => S.seenCfg.mark && (seenPercentOf(it) ?? 0) >= S.seenCfg.threshold;
-// 100% reads 看完了, otherwise 看到 N%; ✓ (and the strong look) means it counts as 看完了.
-const seenWords = (p, done) => (p >= 100 ? "✓ 看完了" : done ? `✓ 看到 ${p}%` : `看到 ${p}%`);
 // The cover with its progress bar and, once 看完了, the corner tag or the veil (html[data-seen-style] picks one).
 // Below the share, a faint 看到 N% says how far it got.
 function coverHtml(it) {
@@ -980,16 +869,14 @@ function coverHtml(it) {
   return `<a class="cover-wrap${seen ? " seen" : ""}" href="${esc(videoUrl(it.bvid))}" tabindex="-1" aria-hidden="true">${pic}${tag}${dur}${mark}${p ? `<span class="seen-bar" title="看到 ${p}%"><i style="width:${Math.max(p, 2)}%"></i></span>` : ""}</a>`;
 }
 
-// Runs simplifyMigration once (flag key), then drops the old scheme keys it read.
+// Runs simplifyMigration once (flag key), then drops the sync criteria it read.
 async function loadTagsAndCriteria() {
-  const got = await chrome.storage.local.get([K.tags, K.videoTags, K.folderCriteria, K.simplified, "triage_schemes", "triage_folder_scheme"]);
+  const got = await chrome.storage.local.get([K.tags, K.videoTags, K.folderCriteria, K.simplified]);
   if (got[K.simplified]) return { tags: got[K.tags] || [], videoTags: got[K.videoTags] || {}, folderCriteria: got[K.folderCriteria] || {} };
   const keys = (await chrome.storage.local.getKeys?.()) ?? Object.keys((await chrome.storage.local.get(null)) || {});
   const folderIds = keys.map((k) => /^triage_(?:snapshot|decisions)_(.+)$/.exec(k)?.[1]).filter(Boolean);
   const { triageCriteria } = await chrome.storage.sync.get({ triageCriteria: "" });
   const out = simplifyMigration({
-    schemes: got.triage_schemes,
-    folderScheme: got.triage_folder_scheme,
     tags: got[K.tags],
     videoTags: got[K.videoTags],
     criteria: triageCriteria,
@@ -997,7 +884,6 @@ async function loadTagsAndCriteria() {
     folderCriteria: got[K.folderCriteria]
   });
   await chrome.storage.local.set({ [K.tags]: out.tags, [K.videoTags]: out.videoTags, [K.folderCriteria]: out.folderCriteria, [K.simplified]: true });
-  await chrome.storage.local.remove(["triage_schemes", "triage_folder_scheme"]);
   await chrome.storage.sync.remove("triageCriteria");
   return out;
 }
@@ -1005,7 +891,7 @@ async function loadTagsAndCriteria() {
 // Runs tagsByFolderMigration until every tag has a folder (flag key), from the cached folder lists.
 async function loadTagsByFolder({ tags, videoTags }) {
   if (await storeGet(K.tagsByFolder, false)) return { tags, videoTags };
-  const keys = ((await chrome.storage.local.getKeys?.()) ?? Object.keys((await chrome.storage.local.get(null)) || {})).filter((k) => k.startsWith("triage_snapshot_"));
+  const keys = ((await chrome.storage.local.getKeys?.()) ?? Object.keys((await chrome.storage.local.get(null)) || {})).filter((k) => k.startsWith(KEYS.triageSnapshotPrefix));
   const got = await chrome.storage.local.get([K.included, K.lastFolder, ...keys]);
   const included = (got[K.included] || []).map(String);
   const cached = keys.map((k) => k.slice(16));
@@ -1036,8 +922,8 @@ function retireUnchosenFolders() {
     if (!S.allFolders.length) return; // 默认收藏夹 always exists; an empty list is never "every folder deleted"
     if (!S.included.length) return; // nothing chosen yet (or all unticked by accident): never empty every folder into 已出分拣范围
     const live = new Set(S.folders.map((f) => String(f.id)));
-    const keys = ((await chrome.storage.local.getKeys?.()) ?? Object.keys((await chrome.storage.local.get(null)) || {})).filter((k) => k.startsWith("triage_snapshot_"));
-    const gone = keys.map((k) => k.slice(16)).filter((id) => !live.has(id));
+    const keys = ((await chrome.storage.local.getKeys?.()) ?? Object.keys((await chrome.storage.local.get(null)) || {})).filter((k) => k.startsWith(KEYS.triageSnapshotPrefix));
+    const gone = keys.map((k) => k.slice(KEYS.triageSnapshotPrefix.length)).filter((id) => !live.has(id));
     if (!gone.length) return;
     const got = await chrome.storage.local.get([K.removed, K.left, ...keys]);
     const otherBvids = new Set([...live].flatMap((id) => got[K.snapshot(id)]?.bvids || []));
@@ -1053,17 +939,13 @@ function retireUnchosenFolders() {
 }
 
 // Opt-in: a new user starts with no folder chosen. The first load after this change keeps every folder for
-// someone who already triaged (a snapshot exists), minus the ones they had switched off.
+// someone who already triaged (a snapshot exists).
 async function loadIncluded() {
-  const got = await chrome.storage.local.get([K.included, "triage_excluded_folders"]);
+  const got = await chrome.storage.local.get(K.included);
   if (Array.isArray(got[K.included])) return got[K.included];
   const keys = (await chrome.storage.local.getKeys?.()) ?? Object.keys((await chrome.storage.local.get(null)) || {});
-  const off = (got.triage_excluded_folders || []).map(String);
-  const included = keys.some((k) => k.startsWith("triage_snapshot_"))
-    ? S.allFolders.map((f) => String(f.id)).filter((id) => !off.includes(id))
-    : [];
+  const included = keys.some((k) => k.startsWith(KEYS.triageSnapshotPrefix)) ? S.allFolders.map((f) => String(f.id)) : [];
   await chrome.storage.local.set({ [K.included]: included });
-  await chrome.storage.local.remove("triage_excluded_folders");
   return included;
 }
 
@@ -1088,9 +970,7 @@ async function loadFolders() {
   el.list.innerHTML = `<p class="empty">正在加载收藏夹列表…</p>`;
   const r = await send({ type: "triage-folders" });
   if (!r.ok) {
-    const needLogin = /登录/.test(r.error || "");
-    if (needLogin) showBanner(r.error, "去登录", () => openTab("https://passport.bilibili.com/login"));
-    else showBanner(`读取收藏夹失败：${r.error}`, "重试", loadFolders);
+    if (BocErrors.action(r.code) !== "login") showBanner(`读取收藏夹失败：${r.error}`, "重试", loadFolders); // send() showed 去登录
     el.list.innerHTML = `<p class="empty">无法读取收藏夹</p>`;
     return;
   }
@@ -1284,9 +1164,8 @@ async function syncFolder({ force = false, cached = null } = {}) {
     r ||= await send({ type: "triage-folder-items", mediaId });
     if (token !== S.folderToken) return false;
     if (!r.ok) {
-      const needLogin = /登录/.test(r.error || "");
-      if (needLogin) showBanner(r.error, "去登录", () => openTab("https://passport.bilibili.com/login"));
-      else S.syncError = `刷新失败：${r.error}`;
+      const needLogin = BocErrors.action(r.code) === "login"; // send() showed 去登录
+      if (!needLogin) S.syncError = `刷新失败：${r.error}`;
       if (!S.items.length) el.list.innerHTML = UI.emptyState("无法读取这个收藏夹", needLogin ? "登录 B站后点刷新。" : r.error, REFRESH_EMPTY);
       return false;
     }
@@ -1418,7 +1297,7 @@ async function checkRemoved(token) {
     const r = await send({ type: "triage-folder-ids", mediaId: id });
     if (token !== S.folderToken) return;
     if (!r.ok && THROTTLES[r.code]) {
-      await throttleWait(r.code, keepGoing, "check");
+      await waitOut("check", THROTTLES[r.code], keepGoing);
       i--;
       continue;
     }
@@ -1452,7 +1331,7 @@ async function checkWhere(token) {
     const r = await send({ type: "triage-fav-where", aid: it.aid, mid });
     if (token !== S.folderToken) break;
     if (!r.ok && THROTTLES[r.code]) {
-      await throttleWait(r.code, keepGoing, "check");
+      await waitOut("check", THROTTLES[r.code], keepGoing);
       i--;
       continue;
     }
@@ -1515,7 +1394,7 @@ async function cleanRemoved(list) {
     for (const map of [...Object.values(decisions), S.decisions, ...Object.values(S.folderDecisions)]) for (const b of bvids) delete map[b];
     noteOwnWrites(decisions);
     await chrome.storage.local.set(decisions);
-    await chrome.storage.local.remove(bvids.flatMap((b) => [`triage_title_${b}`, `triage_analysis_${b}`]));
+    await chrome.storage.local.remove(bvids.flatMap((b) => [KEYS.triageTitle(b), KEYS.triageAnalysis(b)]));
     const write = { [K.removed]: rec, [K.notes]: S.notes, [K.videoTags]: S.videoTags, [K.kept]: S.kept, [K.basket]: S.basket };
     noteOwnWrites(write);
     await chrome.storage.local.set(write);
@@ -1546,8 +1425,8 @@ async function loadResults(token) {
     return stamp[key];
   };
   for (const b of missing) {
-    if (t.ok && t.data?.[b]) S.titleRes[b] = stamped(`triage_title_${b}`, t.data[b]);
-    if (a.ok && a.data?.[b]) S.analyses[b] = stamped(`triage_analysis_${b}`, a.data[b]);
+    if (t.ok && t.data?.[b]) S.titleRes[b] = stamped(KEYS.triageTitle(b), t.data[b]);
+    if (a.ok && a.data?.[b]) S.analyses[b] = stamped(KEYS.triageAnalysis(b), a.data[b]);
   }
   if (Object.keys(stamp).length) await chrome.storage.local.set(stamp);
   return true;
@@ -1619,7 +1498,7 @@ async function runLoadAll(token) {
       const r = await send({ type: "triage-folder-ids", mediaId: id });
       if (token !== S.folderToken) return;
       if (!r.ok && THROTTLES[r.code]) {
-        await throttleWait(r.code, keepGoing, "load");
+        await waitOut("load", THROTTLES[r.code], keepGoing);
         continue;
       }
       if (!r.ok) {
@@ -1655,7 +1534,7 @@ async function runLoadAll(token) {
     L.current = "";
     if (token !== S.folderToken) return;
     if (!r.ok && THROTTLES[r.code]) {
-      await throttleWait(r.code, keepGoing, "load");
+      await waitOut("load", THROTTLES[r.code], keepGoing);
       continue;
     }
     if (!r.ok) {
@@ -1856,14 +1735,20 @@ function activityState() {
     return { text: wait || text, done: S.stage1.done, total: S.stage1.total, act: "stage1", actLabel: S.stage1.stop ? "暂停中" : "暂停粗看", stopping: S.stage1.stop, stuck: Boolean(wait) };
   }
   const move = S.transferRun;
-  if (move) return { text: `${move.verb}到「${move.toName}」${move.done}/${move.total}${runWhere(move)}`, done: move.done, total: move.total };
+  if (move) {
+    const wait = waitOf("transfer");
+    return { text: wait || `${move.verb}到「${move.toName}」${move.done}/${move.total}${runWhere(move)}`, done: move.done, total: move.total, stuck: Boolean(wait) };
+  }
   const unfav = S.unfavBatch;
   if (unfav) {
     const wait = waitOf("unfav");
     return { text: wait || `取消收藏中${unfavWhere(unfav)} ${unfav.done}/${unfav.total}${runWhere(unfav)}`, done: unfav.done, total: unfav.total, stuck: Boolean(wait) };
   }
   const refav = S.refavRun;
-  if (refav) return { text: `重新收藏中${unfavWhere(refav)} ${refav.done}/${refav.total}${runWhere(refav)}`, done: refav.done, total: refav.total };
+  if (refav) {
+    const wait = waitOf("refav");
+    return { text: wait || `重新收藏中${unfavWhere(refav)} ${refav.done}/${refav.total}${runWhere(refav)}`, done: refav.done, total: refav.total, stuck: Boolean(wait) };
+  }
   const w = S.write;
   if (w.running) {
     const wait = waitOf("write");
@@ -1875,12 +1760,13 @@ function activityState() {
   const c = S.removedCheck;
   wait = waitOf("check");
   if (c && !c.error) return { text: wait || `核对${c.what} ${c.done}/${c.total}`, done: c.done, total: c.total, stuck: Boolean(wait) };
-  wait = Object.keys(S.waits).map(waitOf).find(Boolean);
+  // Any other 收藏夹 wait; "ai" shows with AI 打标签 below, and 关注 draws its own.
+  wait = Object.keys(S.waits).filter((job) => job !== "ai" && !job.startsWith("follow-")).map(waitOf).find(Boolean);
   if (wait) return { text: wait, stuck: true };
   if (S.syncing) return { text: `刷新中…${pageText(S.mediaId)}` };
   if (S.ai.running) {
     const where = S.ai.mediaId === String(S.mediaId) ? "" : `（${folderName(S.ai.mediaId)}）`;
-    return { ...UI.aiActivity(S.ai, where), act: "tags", actLabel: "查看" };
+    return { ...UI.aiActivity(S.ai, waitOf("ai"), where), act: "tags", actLabel: "查看" };
   }
   if (S.ai.proposal) return { text: "标签建议待确认", act: "tags", actLabel: "查看" };
   const other = otherAiFolder();
@@ -1899,7 +1785,9 @@ function renderStatus() {
 }
 
 function tick() {
-  if (Object.keys(S.waits).length) renderStatus();
+  const waits = Object.values(S.waits);
+  if (waits.length) renderStatus();
+  for (const w of waits) w.onTick?.();
   if (!S.seenRead.until) return;
   renderStatus();
   // The wait is over: read again, as the pill said.
@@ -2168,8 +2056,9 @@ window.addEventListener("beforeunload", (e) => {
   e.returnValue = true;
 });
 
-// Re-favorites items ([{ bvid, aid }]) into mediaId one by one, stopping at the first failure. It changes Bilibili, so
-// it runs to the end even after another folder opens. It counts in the pill's S.refavRun: its own, or run when the
+// Re-favorites items ([{ bvid, aid }]) into mediaId one by one, stopping at the first failure; every 重新收藏 goes
+// through here, so each marks the folder written (markWritten). It changes Bilibili, so it runs to the end even after
+// another folder opens. It counts in the pill's S.refavRun: its own, or run when the
 // caller spans several folders.
 async function refavMany(mediaId, items, run = null) {
   const own = !run;
@@ -2183,6 +2072,11 @@ async function refavMany(mediaId, items, run = null) {
   while (rest.length) {
     if (n) await new Promise((r) => setTimeout(r, 300));
     const r = await send({ type: "triage-refav", mediaId, aid: rest[0].aid });
+    // B站 risk control: wait out the countdown, then the same video again (as batch 取消收藏).
+    if (!r.ok && THROTTLES[r.code]) {
+      await waitOut("refav", THROTTLES[r.code], () => true);
+      continue;
+    }
     if (!r.ok) {
       error = r.error;
       break;
@@ -2224,20 +2118,10 @@ async function refavRecent(bvid) {
   const d = S.decisions[bvid];
   if (!d?.aid || refaving.has(bvid)) return;
   const mediaId = S.mediaId;
-  refaving.add(bvid);
-  render();
-  const r = await send({ type: "triage-refav", mediaId, aid: d.aid });
-  refaving.delete(bvid);
-  if (!r.ok) {
-    render();
-    toast(`重新收藏失败：${r.error}`, true);
-    return;
-  }
-  bumpCount(mediaId, 1);
-  await patchDecisions(mediaId, { [bvid]: null });
+  const { error } = await refavMany(String(mediaId), [{ bvid, aid: d.aid }]);
+  if (error) return toast(`重新收藏失败：${error}`, true);
   if (mediaId !== S.mediaId) return;
   toast(`已重新收藏《${d.title || bvid}》`);
-  render();
   quickSync({ force: true });
 }
 
@@ -2570,12 +2454,11 @@ async function undo() {
     if (entry.action === "unfav") toast(`正在重新收藏《${shortTitle(it)}》…`);
     for (const [mediaId, prev] of Object.entries(entry.prevs)) {
       if (entry.action === "unfav") {
-        const r = await send({ type: "triage-refav", mediaId, aid: it.aid });
-        if (!r.ok) {
-          if (token === S.folderToken) toast(`撤销失败：${r.error}。可到 B站手动重新收藏`, true);
+        const { error } = await refavMany(mediaId, [{ bvid: entry.bvid, aid: it.aid }]);
+        if (error) {
+          if (token === S.folderToken) toast(`撤销失败：${error}。可到 B站手动重新收藏`, true);
           return;
         }
-        bumpCount(mediaId, 1);
       }
       await patchDecisions(mediaId, { [entry.bvid]: prev });
     }
@@ -2701,7 +2584,7 @@ async function batchUnfav(list) {
       chunk.forEach((it) => deciding.delete(it.bvid));
       // B站 risk control: wait out the countdown, then the same chunk again.
       if (!r.ok && THROTTLES[r.code]) {
-        await throttleWait(r.code, () => true, "unfav");
+        await waitOut("unfav", THROTTLES[r.code], () => true);
         i -= size;
         continue;
       }
@@ -2833,8 +2716,7 @@ function patchSnapshot(mediaId, { add = [], drop = [] }, created = false) {
         invalid: (old.invalid || []).filter(keep),
         titles: { ...old.titles, ...Object.fromEntries(fresh.map((it) => [it.bvid, it.title])) },
         items: [...fresh, ...(old.items || []).filter((it) => keep(it.bvid))],
-        ids: old.ids ? [...added, ...old.ids.filter(keep)] : old.ids,
-        at: Date.now()
+        ids: old.ids ? [...added, ...old.ids.filter(keep)] : old.ids
       }
     });
   });
@@ -2878,6 +2760,12 @@ async function batchTransfer(list) {
     render();
     const r = await send({ type: "triage-transfer", from: add ? "" : from, to, aids: chunk.map((it) => it.aid), move });
     chunk.forEach((it) => moving.delete(it.bvid));
+    // B站 risk control: wait out the countdown, then the same chunk again (as batch 取消收藏).
+    if (!r.ok && THROTTLES[r.code]) {
+      await waitOut("transfer", THROTTLES[r.code], () => true);
+      i -= size;
+      continue;
+    }
     if (!r.ok) {
       toast(`${S.mediaId === from ? "" : `「${folderName(from)}」`}${verb}到「${toName}」中断（已完成 ${done} 个）：${r.error}`, true);
       break;
@@ -3211,15 +3099,22 @@ function aiItem(it) {
   return { bvid: it.bvid, title: it.title, upper: it.upper, duration: it.duration, pubdate: it.pubdate, intro: it.intro };
 }
 
-async function throttleWait(code, keepGoing, job) {
-  const [ms, label] = THROTTLES[code];
-  S.waits[job] = { until: Date.now() + ms, label };
+// The one wait of the 分拣台 (both modes): job's countdown for ms, or until keepGoing() turns false. tick() redraws it
+// each second: the 收藏夹 pill, and onTick for a line drawn elsewhere (关注's pill, the AI 打标签 dialog).
+async function waitOut(job, { ms, label }, keepGoing, onTick = null) {
+  S.waits[job] = { until: Date.now() + ms, label, onTick };
   renderStatus();
+  onTick?.();
   await sleepWhile(ms, keepGoing);
   delete S.waits[job];
   renderStatus();
+  onTick?.();
 }
-const waitOf = (job) => (S.waits[job] ? UI.waitText(S.waits[job].label, Math.ceil((S.waits[job].until - Date.now()) / 1000)) : "");
+// 「B站限流卡住，1:30 后重试」 while job waits, else "".
+function waitOf(job) {
+  const w = S.waits[job];
+  return w ? UI.waitText(w.label, Math.ceil((w.until - Date.now()) / 1000)) : "";
+}
 
 // What 标题粗看 counts and sends: the 未分析 videos listed now (search and filters applied), not the hidden ones.
 const stage1Pending = () => S.items.filter((it) => stageOf(it) === "none" && !S.stage1Skip.has(it.bvid) && passFilter(it));
@@ -3245,8 +3140,7 @@ async function runStage1(list = stage1Pending()) {
   const keepGoing = () => !S.stage1.stop;
   const size = Math.max(1, Number(S.settings.triageTitleBatchSize) || 30);
   let done = 0;
-  let timeouts = 0;
-  let aiWaits = 0;
+  const n = { timeouts: 0, waits: 0 };
   let failedOut = false;
   render();
   while (keepGoing()) {
@@ -3258,21 +3152,20 @@ async function runStage1(list = stage1Pending()) {
     S.stage1.text = `标题粗看中 ${done}/${total}`;
     for (const it of batch) S.analyzing.add(it.bvid);
     render();
-    let r = await send({ type: "triage-classify-titles", items: batch.map(aiItem), criteria: crit, folder: ctx });
+    const sent = await send({ type: "triage-classify-titles", items: batch.map(aiItem), criteria: crit, folder: ctx });
     for (const it of batch) S.analyzing.delete(it.bvid);
-    if (!r.ok) {
-      // A timeout sends the same batch again; the second in a row ends the run, as any other error does.
-      if (r.code === "AI_TIMEOUT" && ++timeouts < AI_TIMEOUT_TRIES) continue;
-      if (r.code === "AI_THROTTLED" && aiWaits++ === AI_THROTTLE_WAITS) r = aiGaveUp();
-      if (THROTTLES[r.code]) {
-        await throttleWait(r.code, keepGoing, "stage1");
-        continue;
-      }
+    // Any error that is not a timeout or a limit ends the run.
+    const [step, r] = aiNext(sent, n, () => true);
+    if (step === "retry") continue;
+    if (step === "wait") {
+      await waitOut("stage1", THROTTLES[r.code], keepGoing);
+      continue;
+    }
+    if (step === "stop") {
       handleAiError(r.error, r.code);
       failedOut = true;
       break;
     }
-    timeouts = aiWaits = 0;
     const results = r.data?.results || {};
     for (const it of batch) {
       if (results[it.bvid]) S.titleRes[it.bvid] = { criteria: crit, ...results[it.bvid] };
@@ -3329,29 +3222,26 @@ async function analyzeOne(bvid, force, { crit, ctx }) {
 async function runGroup() {
   const group = S.group;
   const keepGoing = () => !group.stop && S.group === group;
-  let timeouts = 0;
-  let aiWaits = 0;
+  const n = { timeouts: 0, waits: 0 };
   render();
   while (keepGoing()) {
     const b = group.bvids.find((x) => groupPending(group, x));
     if (!b) break;
     group.text = `${group.redo ? "按新标准重新细看" : "字幕细看"} ${groupDone(group) + 1}/${group.bvids.length}`;
     const judge = group.judge.get(b);
-    let r = await analyzeOne(b, Boolean(group.redo), judge);
-    // An error that is not this video's ends the run and leaves the card as it was; a timeout first tries it again.
-    if (!r.ok && r.code === "AI_TIMEOUT" && ++timeouts < AI_TIMEOUT_TRIES) continue;
-    if (!r.ok && r.code === "AI_THROTTLED" && aiWaits++ === AI_THROTTLE_WAITS) r = aiGaveUp();
-    if (!r.ok && THROTTLES[r.code]) {
+    // An error that is not this video's ends the run and leaves the card as it was.
+    const [step, r] = aiNext(await analyzeOne(b, Boolean(group.redo), judge), n);
+    if (step === "retry") continue;
+    if (step === "wait") {
       render();
-      await throttleWait(r.code, keepGoing, "group");
+      await waitOut("group", THROTTLES[r.code], keepGoing);
       continue;
     }
-    if (!r.ok && aiEnds(r)) {
+    if (step === "stop") {
       handleAiError(r.error, r.code);
       group.stop = true;
       break;
     }
-    timeouts = aiWaits = 0;
     group.redo?.delete(b);
     const keepOld = !r.ok && group.redo && S.analyses[b]?.status === "done";
     if (keepOld) toast(`重新细看失败，保留原来的结果：${r.error}`, true);
@@ -3496,37 +3386,28 @@ const openAi = () => TagDialogs.ai.open(aiTags);
 // batch alike (aiEnds) ends the run. Returns
 // { proposal, errors }: proposal is null when no batch got through, so there is nothing to confirm (the progress line says why).
 // name(i), when given, says which batch in the progress line and errors (所有收藏夹 names the folder).
-// at, the mode's run state, gets { done, total, until, label } for the pill; progress runs at least once a second while
-// waiting, so the pill and the dialog count down.
-async function runAiBatches({ total, request, merge, intervalMs, keepGoing, progress, at, name = null }) {
+// at, the mode's run state, gets { done, total } for the pill; a limit waits as job (waitOut), and progress runs once a
+// second meanwhile, so the pill and the dialog count down.
+async function runAiBatches({ total, request, merge, intervalMs, keepGoing, progress, at, job, name = null }) {
   const which = (i, full = false) => (name ? name(i) : full ? `第 ${i + 1} / ${total} 批` : `第 ${i + 1} 批`);
   const p = { newTags: [], rows: [], notes: [], errors: [] };
   let answered = 0;
-  let timeouts = 0;
-  let aiWaits = 0;
-  Object.assign(at, { done: 0, total, until: 0 });
+  const n = { timeouts: 0, waits: 0 };
+  Object.assign(at, { done: 0, total });
   for (let i = 0; i < total && keepGoing(); i++) {
     at.done = i;
     progress(`AI 正在处理${which(i, true)}…`);
-    let r = await send(request(i, p));
-    if (!r.ok && r.code === "AI_TIMEOUT" && ++timeouts < AI_TIMEOUT_TRIES) {
+    const [step, r] = aiNext(await send(request(i, p)), n);
+    if (step === "retry") {
       i--;
       continue;
     }
-    if (!r.ok && r.code === "AI_THROTTLED" && aiWaits++ === AI_THROTTLE_WAITS) r = aiGaveUp();
-    if (!r.ok && THROTTLES[r.code]) {
-      const [ms, label] = THROTTLES[r.code];
-      Object.assign(at, { until: Date.now() + ms, label });
-      for (let sec = Math.round(ms / 1000); sec > 0 && keepGoing(); sec--) {
-        progress(`${UI.waitText(label, sec)}${which(i)}…`);
-        await sleepWhile(1000, keepGoing);
-      }
-      at.until = 0;
+    if (step === "wait") {
+      await waitOut(job, THROTTLES[r.code], keepGoing, () => waitOf(job) && progress(`${waitOf(job)}${which(i)}…`));
       i--;
       continue;
     }
-    const ends = !r.ok && aiEnds(r);
-    timeouts = aiWaits = 0;
+    const ends = step === "stop";
     if (!r.ok) {
       p.errors.push(`${which(i)}失败：${r.error}`);
       // 截断 is reported with what to change.
@@ -3598,7 +3479,8 @@ async function runAiCommand({ instruction, scope, allowRemove }) {
     intervalMs: S.settings.triageIntervalSec * 1000,
     keepGoing: () => !S.ai.stop,
     progress: (text) => (TagDialogs.ai.progress(aiTags, text, folder), renderStatus()),
-    at: S.ai
+    at: S.ai,
+    job: "ai"
   });
   S.ai.running = false;
   if (p) {
@@ -3724,10 +3606,6 @@ function renderBasket() {
     .join("");
 }
 
-function mdLinkText(s) {
-  return String(s).replace(/([\[\]])/g, "\\$1");
-}
-
 // 一篇摘录: one Markdown file with each video's link, AI summary, tags and note.
 function buildMarkdown(items, now = new Date()) {
   const lines = [
@@ -3839,21 +3717,8 @@ async function exportDigest(how) {
     setBusy(el.writeRunBtn, false);
     el.writeProgress.textContent = r.ok ? `已写入 ${r.data?.path || filename}` : `写入 Obsidian 失败：${r.error}`;
     el.writeProgress.classList.toggle("fail-text", !r.ok);
-    el.writeSettingsBtn.hidden = r.code !== "OBSIDIAN";
+    el.writeSettingsBtn.hidden = BocErrors.action(r.code) !== "settings";
   }
-}
-
-function safeNoteName(name) {
-  return String(name).replace(/[\\/:*?"<>|#^[\]]/g, "_").trim() || "收藏夹";
-}
-
-const oneLine = (s) => String(s ?? "").replace(/\s+/g, " ").trim();
-// A relative link inside the zip; <> keeps spaces in the filename (note filenames never hold < or >).
-const mdLink = (path, title) => `[${oneLine(title).replace(/[[\]\\]/g, "\\$&") || path}](<${path}>)`;
-// | [ ] or a newline in the alias would end the link early; the path is already a safe note filename.
-function wikiLink(path, title) {
-  const target = String(path).replace(/\.md$/, "");
-  return `[[${target}|${oneLine(String(title ?? "").replace(/[|[\]]/g, " ")) || target}]]`;
 }
 
 // The 逐个视频笔记 index, the same in the vault and in the zip; only the link form differs. title: the run's folder.
@@ -3863,42 +3728,6 @@ function indexMarkdown(written, link, title) {
     lines.push(`- ${link(w.path, w.title)}${w.oneLiner ? ` ${oneLine(w.oneLiner)}` : ""}`);
   }
   return lines.join("\n");
-}
-
-const CRC_TABLE = Uint32Array.from({ length: 256 }, (_, n) => {
-  for (let k = 0; k < 8; k++) n = n & 1 ? 0xedb88320 ^ (n >>> 1) : n >>> 1;
-  return n >>> 0;
-});
-function crc32(bytes) {
-  let c = ~0;
-  for (const b of bytes) c = CRC_TABLE[(c ^ b) & 0xff] ^ (c >>> 8);
-  return ~c >>> 0;
-}
-
-// files: [{ name, text }] → zip bytes. Stored (no compression); flag bit 11 marks the names as UTF-8.
-// "Made by" Unix with mode 0644: made by DOS, Info-ZIP unzip (macOS's) reads the names as a DOS code page and mangles them.
-function zipStored(files, now = new Date()) {
-  const enc = new TextEncoder();
-  const entries = files.map((f) => ({ name: enc.encode(f.name), data: enc.encode(f.text) }));
-  const localSize = entries.reduce((n, e) => n + 30 + e.name.length + e.data.length, 0);
-  const centralSize = entries.reduce((n, e) => n + 46 + e.name.length, 0);
-  const out = new Uint8Array(localSize + centralSize + 22);
-  const view = new DataView(out.buffer);
-  const put = (at, fields) => fields.reduce((p, [size, value]) => (size === 2 ? view.setUint16(p, value, true) : view.setUint32(p, value, true), p + size), at);
-  const time = (now.getHours() << 11) | (now.getMinutes() << 5) | (now.getSeconds() >> 1);
-  const date = ((now.getFullYear() - 1980) << 9) | ((now.getMonth() + 1) << 5) | now.getDate();
-  let local = 0;
-  let central = localSize;
-  for (const e of entries) {
-    const common = [[2, 20], [2, 0x0800], [2, 0], [2, time], [2, date], [4, crc32(e.data)], [4, e.data.length], [4, e.data.length], [2, e.name.length], [2, 0]];
-    out.set(e.name, put(local, [[4, 0x04034b50], ...common]));
-    out.set(e.data, local + 30 + e.name.length);
-    out.set(e.name, put(central, [[4, 0x02014b50], [2, 0x0314], ...common, [2, 0], [2, 0], [2, 0], [4, 0x81a40000], [4, local]]));
-    local += 30 + e.name.length + e.data.length;
-    central += 46 + e.name.length;
-  }
-  put(central, [[4, 0x06054b50], [2, 0], [2, 0], [2, entries.length], [2, entries.length], [4, centralSize], [4, localSize], [2, 0]]);
-  return out;
 }
 
 // The zip's files: the index named after the folder, then each note under its vault filename (a repeat gets " (2)").
@@ -3913,6 +3742,8 @@ function zipNotes(base, written, title) {
   return [{ name: `${base}.md`, text: indexMarkdown(notes, mdLink, title) }, ...notes.map((w) => ({ name: w.path, text: w.markdown }))];
 }
 
+// Obsidian itself unusable (triage-bg.js triageObsidianError): every later note would fail alike, so the run stops.
+const OBSIDIAN_CODES = new Set(["OBSIDIAN", "OBSIDIAN_DOWN"]);
 // md: build the same notes but download them as a zip (one note each plus the index) instead of writing to the vault.
 // The run keeps going with the dialog closed or another folder open: the activity pill shows it, the dialog reopens on it.
 async function runWrite(md = false) {
@@ -3934,11 +3765,11 @@ async function runWrite(md = false) {
     el.writeFailed.hidden = !failed.length;
   };
   // Obsidian closed, not set up or refusing the key fails every note alike: checked first, and such a failure ends the run.
-  let obsidian = "";
+  let obsidian = null; // the reply that showed Obsidian itself is unusable
   if (!md) {
     el.writeProgress.textContent = "正在检查 Obsidian…";
     const r = await send({ type: "triage-obsidian-check" });
-    if (!r.ok) obsidian = r.error;
+    if (!r.ok) obsidian = r;
   }
   for (let i = 0; i < items.length && !obsidian && keepGoing(); i++) {
     const it = items[i];
@@ -3947,12 +3778,12 @@ async function runWrite(md = false) {
     // B站 risk control: wait as 粗看 / 细看 do, then the same video again.
     if (!r.ok && THROTTLES[r.code]) {
       el.writeProgress.textContent = `${THROTTLES[r.code][1]}，等待后重试：${it.title}`;
-      await throttleWait(r.code, keepGoing, "write");
+      await waitOut("write", THROTTLES[r.code], keepGoing);
       i--;
       continue;
     }
-    if (!r.ok && r.code === "OBSIDIAN") {
-      obsidian = r.error;
+    if (!r.ok && OBSIDIAN_CODES.has(r.code)) {
+      obsidian = r;
       break;
     }
     if (r.ok) written.push({ ...r.data, bvid: it.bvid, oneLiner: oneLiners[it.bvid] });
@@ -3984,15 +3815,16 @@ async function runWrite(md = false) {
     failed.length ? `失败 ${failed.length} 篇` : ""
   ].filter(Boolean);
   el.writeProgress.textContent = [
-    obsidian ? `写入 Obsidian 失败：${obsidian}。已停止` : S.write.stop ? "已停止。" : "完成。",
+    obsidian ? `写入 Obsidian 失败：${obsidian.error}。已停止` : S.write.stop ? "已停止。" : "完成。",
     ...counts,
     indexPath ? `${md ? "文件" : "索引"}：${indexPath}` : ""
   ].filter(Boolean).join(" · ");
   el.writeProgress.classList.toggle("fail-text", Boolean(obsidian));
-  el.writeSettingsBtn.hidden = !obsidian;
+  const toSettings = BocErrors.action(obsidian?.code) === "settings";
+  el.writeSettingsBtn.hidden = !toSettings;
   showFailed();
-  // The pill's green line; an Obsidian failure goes to the red banner instead, which leads to the settings page.
-  if (obsidian) showBanner(`写入 Obsidian 失败：${obsidian}`, "去设置", () => send({ type: "open-options" }), "obsidian");
+  // The pill's green line; an Obsidian failure goes to the red banner instead, with 去设置 unless Obsidian is just not running.
+  if (obsidian) showBanner(`写入 Obsidian 失败：${obsidian.error}`, toSettings ? "去设置" : "", () => send({ type: "open-options" }), "obsidian");
   else S.write.text = `逐个视频笔记${S.write.stop ? "已停止" : "完成"}：${counts.join(" · ")}`;
   renderWriteScope();
   renderStatus();
@@ -4000,7 +3832,8 @@ async function runWrite(md = false) {
 
 // ---------- data export ----------
 // 待播 stays out: a list to watch from, not something to keep.
-const BACKUP_PREFIXES = [K.kept, K.removed, K.left, K.tags, K.folderCriteria, "triage_video_tags", K.notes, "triage_snapshot_", "triage_decisions_", "triage_title_", "triage_analysis_"];
+const { triageSnapshotPrefix: SNAPSHOT, triageTitlePrefix: TITLE, triageAnalysisPrefix: ANALYSIS } = KEYS;
+const BACKUP_PREFIXES = [K.kept, K.removed, K.left, K.tags, K.folderCriteria, K.videoTags, K.notes, SNAPSHOT, "triage_decisions_", TITLE, ANALYSIS];
 
 async function buildBackup() {
   const all = await chrome.storage.local.get(null);
@@ -4031,12 +3864,12 @@ async function buildBackup() {
     else if (k === K.removed) out.removed = v;
     else if (k === K.left) out.left = v;
     else if (k === K.folderCriteria) out.folderCriteria = v;
-    else if (k === "triage_video_tags") out.videoTags = v;
+    else if (k === K.videoTags) out.videoTags = v;
     else if (k === K.notes) out.notes = v;
-    else if (k.startsWith("triage_snapshot_")) folder(k.slice(16)).snapshot = v;
+    else if (k.startsWith(SNAPSHOT)) folder(k.slice(SNAPSHOT.length)).snapshot = v;
     else if (k.startsWith("triage_decisions_")) folder(k.slice(17)).decisions = v;
-    else if (k.startsWith("triage_title_")) out.titleResults[k.slice(13)] = v;
-    else if (k.startsWith("triage_analysis_")) out.analyses[k.slice(16)] = v;
+    else if (k.startsWith(TITLE)) out.titleResults[k.slice(TITLE.length)] = v;
+    else if (k.startsWith(ANALYSIS)) out.analyses[k.slice(ANALYSIS.length)] = v;
   }
   // 关注's own data (UP tags, who has which, 已取消关注, the last AI batch); its copies of B站 data come back on 刷新.
   out.follow = {};

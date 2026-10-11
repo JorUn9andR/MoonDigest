@@ -87,9 +87,19 @@ const ctx = vm.createContext({
 });
 ctx.window = ctx;
 ctx.globalThis = ctx;
-for (const f of ["limits.js", "typing.js", "sites.js", "note.js"]) vm.runInContext(fs.readFileSync(path.join(__dirname, f), "utf8"), ctx);
+// The scripts the manifest injects before content.js, read from it so the test cannot load a different set.
+const entries = JSON.parse(fs.readFileSync(path.join(__dirname, "manifest.json"), "utf8")).content_scripts.filter((c) => c.js.includes("content.js"));
+assert.ok(entries.length && entries.every((c) => JSON.stringify(c.js) === JSON.stringify(entries[0].js)), "every content.js entry injects the same scripts");
+const scripts = [...entries[0].js];
+assert.strictEqual(scripts.pop(), "content.js", "content.js loads last");
+for (const f of scripts) vm.runInContext(fs.readFileSync(path.join(__dirname, f), "utf8"), ctx);
 vm.runInContext(`${source}\n;globalThis.state = state;`, ctx);
 const t = ctx;
+const realRenderReadingView = t.renderReadingView;
+// Untrusted text (titles, UP names, comments, AI replies, tag names, paths) stays text: no tag of its own, no way out of
+// a quoted attribute.
+const XSS = ["<img src=x onerror=alert(1)>", `"'><script>alert(1)</script>`];
+const assertInert = (html, where) => assert.ok(!/<img src=x|<script|"'>/i.test(html) && /&lt;|&#60;/.test(html), `${where}: ${html}`);
 const { state } = t;
 for (const f of ["setStatus", "setMessage", "setReadingNotice", "renderReadingView", "syncReadingViewPlayback", "rebuildDerivedContent", "logInfo", "logWarn"]) t[f] = () => {};
 t.byId = stubEl;
@@ -419,6 +429,46 @@ const settle = async () => {
   assert.strictEqual(t.fetchErrorText(Object.assign(new Error("风控校验失败"), { code: -352 })), "B站限流，请稍后再试");
   assert.strictEqual(t.fetchErrorText(new TypeError("Failed to fetch")), "网络断了");
   assert.strictEqual(t.fetchErrorText(Object.assign(new Error("啥都木有"), { code: -404 })), "啥都木有");
+  // X8: risk control is not retried (that only digs deeper); a dropped connection or another negative code still is.
+  {
+    const tries = async (error) => {
+      let n = 0;
+      await t.retryAsync(async () => {
+        if (++n === 1) throw error;
+      }, 2, 0).catch(() => {});
+      return n;
+    };
+    // sites.js marks every negative B站 code retryable; risk codes stop here all the same.
+    for (const code of [-352, -412, -799, -509]) assert.strictEqual(await tries(Object.assign(new Error("x"), { code, retryable: true })), 1, String(code));
+    assert.strictEqual(await tries(Object.assign(new Error("请求失败：412"), { status: 412 })), 1, "HTTP 412");
+    assert.strictEqual(await tries(new TypeError("Failed to fetch")), 2, "a dropped connection is retried");
+    assert.strictEqual(await tries(Object.assign(new Error("x"), { code: -500, retryable: true })), 2);
+  }
+
+  // The video's subtitle names, chapter titles and subtitle lines come from the site.
+  {
+    const saved = Object.fromEntries(["subtitles", "chapters", "subtitleBody"].map((k) => [k, state[k]]));
+    const after = ["updateReaderChapterPresence", "renderReadingInfoPanel", "renderReadingSubtitleSelect", "renderReaderPanels", "applyReadingViewPresentation", "updateReadingTranscriptTailSpacer"];
+    const real = after.map((f) => t[f]);
+    after.forEach((f) => (t[f] = () => {}));
+    const realById = t.byId;
+    for (const bad of XSS) {
+      state.subtitles = [{ url: bad, id: bad, label: bad, lang: bad }];
+      const select = {};
+      t.renderSubtitleOptions(select);
+      assertInert(select.innerHTML, "subtitle options");
+      const nodes = {};
+      t.byId = (id) => (nodes[id] ||= { insertAdjacentHTML() {} });
+      state.chapters = [{ from: 0, title: bad }];
+      state.subtitleBody = [{ from: 0, to: 1, content: bad }];
+      realRenderReadingView();
+      const ids = vm.runInContext("ids", ctx);
+      for (const id of [ids.readingChapterList, ids.readingTranscriptList]) assertInert(nodes[id].innerHTML, id);
+    }
+    t.byId = realById;
+    after.forEach((f, i) => (t[f] = real[i]));
+    Object.assign(state, saved);
+  }
 
   console.log("content selftest: all passed");
 })().catch((e) => {

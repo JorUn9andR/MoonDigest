@@ -1,6 +1,6 @@
 // Note builder shared by content.js (manifest js list), background.js (importScripts)
 // and the extension pages (<script>). Pure: everything it reads arrives as arguments.
-// Needs BocSites (sites.js) loaded first. Idempotent like sites.js.
+// Needs BocSites (sites.js) and BocSettings (settings.js) loaded first. Idempotent like sites.js.
 //
 // meta     the content-script state shape: title, site, videoId, cid, aid, author, authorUrl,
 //          uploadDate, videoDuration, cover, videoTags, selectedSubtitleLang, description,
@@ -14,21 +14,9 @@
     return;
   }
 
-  const DEFAULT_FRONTMATTER_FIELDS = [
-    "title",
-    "url",
-    "site",
-    "video_id",
-    "cid",
-    "author",
-    "author_url",
-    "upload_date",
-    "duration",
-    "cover",
-    "subtitle_lang",
-    "created",
-    "tags"
-  ];
+  const S = globalThis.BocSettings;
+  const { escapeHtml } = globalThis.BocErrors;
+  const DEFAULT_FRONTMATTER_FIELDS = S.DEFAULTS.frontmatterFields;
   // Every field a note can carry; DEFAULT_FRONTMATTER_FIELDS is the subset on by default.
   const FRONTMATTER_FIELDS = [...DEFAULT_FRONTMATTER_FIELDS, "video_tags"];
 
@@ -94,7 +82,7 @@
     );
     const frontMatter = buildFrontMatter(meta, settings, url, created, tagsCsv, tagsYaml);
 
-    const embedIframe = (ref && BocSites.SITES[ref.site]?.embedHtml(ref, meta)) || "";
+    const embedIframe = (settings.playerEmbed !== false && ref && BocSites.SITES[ref.site]?.embedHtml(ref, meta)) || "";
     const intro = String(meta.description || "").trim();
     const noteSectionContext = buildNotePlaceholderTemplateContext(meta, url, intro);
     const noteSections = groupNotePlaceholderSections(settings, noteSectionContext);
@@ -368,7 +356,7 @@
     if (analysis.oneLiner) lines.push(`> ${analysis.oneLiner}`, "");
     const points = (analysis.points || []).filter(Boolean);
     if (points.length) lines.push(...points.map((p) => `- ${p}`), "");
-    const verdict = { keep: "值得留", drop: "可清理", unsure: "拿不准" }[analysis.verdict];
+    const verdict = BocTagCore.VERDICTS[analysis.verdict];
     if (verdict) lines.push(`AI 判断：${verdict}${analysis.reason ? `，${analysis.reason}` : ""}`);
     return lines.join("\n").trim();
   }
@@ -463,10 +451,10 @@
 
     rows.forEach((item) => {
       const key = String(item?.key || "").trim();
-      const type = normalizeFixedPropertyType(item?.type);
+      const type = S.normalizeFixedPropertyType(item?.type);
       const value = item?.value;
       const lowerKey = key.toLowerCase();
-      if (!key || isFixedPropertyRowEffectivelyEmpty(type, value)) {
+      if (!key || S.isFixedPropertyRowEffectivelyEmpty(type, value)) {
         return;
       }
       if (!customPropertyKeyPattern.test(key)) {
@@ -483,15 +471,6 @@
     });
 
     return lines;
-  }
-
-  function normalizeFixedPropertyType(value) {
-    const type = String(value || "").trim().toLowerCase();
-    return type === "number" || type === "checkbox" || type === "list" || type === "date" ? type : "text";
-  }
-
-  function isFixedPropertyRowEffectivelyEmpty(type, value) {
-    return !String(value || "").trim();
   }
 
   function buildFrontmatterTemplateContext(meta, url, created, tagsCsv, tagsYaml) {
@@ -576,7 +555,7 @@
       before_chapters: [],
       before_subtitle: []
     };
-    const rows = normalizeNotePlaceholderSections(settings?.notePlaceholderSections);
+    const rows = S.normalizeNotePlaceholderSections(settings?.notePlaceholderSections);
     rows.forEach((item) => {
       const renderedLines = buildNotePlaceholderLines(item, templateContext);
       if (!renderedLines.length) {
@@ -630,7 +609,7 @@
   }
 
   function formatFixedPropertyYamlLine(key, type, value, templateContext = {}) {
-    const normalizedType = normalizeFixedPropertyType(type);
+    const normalizedType = S.normalizeFixedPropertyType(type);
     const resolvedValue = resolveFrontmatterTemplateValue(value, templateContext).trim();
 
     if (!resolvedValue) {
@@ -666,28 +645,6 @@
     }
 
     return `${key}: "${escapeYaml(resolvedValue)}"`;
-  }
-
-  function normalizeNotePlaceholderSections(items) {
-    const allowedPositions = new Set(["before_intro", "before_chapters", "before_subtitle"]);
-    if (!Array.isArray(items)) {
-      return [];
-    }
-    return items
-      .map((item) => {
-        const title = String(item?.title || "").trim();
-        const position = allowedPositions.has(String(item?.position || "").trim())
-          ? String(item?.position || "").trim()
-          : "before_intro";
-        const content = String(item?.content || "").trim();
-        return {
-          title,
-          position,
-          content
-        };
-      })
-      .filter((item) => item.title)
-      .slice(0, 5);
   }
 
   function buildSubtitleSectionLines(body, chapters, settings, withHours) {
@@ -1063,18 +1020,14 @@
       });
   }
 
-  function escapeHtml(value) {
-    return String(value)
-      .replaceAll("&", "&amp;")
-      .replaceAll("<", "&lt;")
-      .replaceAll(">", "&gt;")
-      .replaceAll('"', "&quot;")
-      .replaceAll("'", "&#39;");
-  }
+  // The note as the AI reads it (video page and background): no hot comments, and no player embed, which is for
+  // Obsidian only; the note written or downloaded keeps it.
+  const buildAiContext = (meta, body, settings, ref) =>
+    buildMarkdown(meta, body, { ...settings, includeHotCommentsInNote: false, playerEmbed: false }, ref);
 
   globalThis.BocNote = {
-    DEFAULT_FRONTMATTER_FIELDS,
     buildMarkdown,
+    buildAiContext,
     AI_SECTION_START,
     AI_SECTION_END,
     TIMESTAMP_PATTERN,

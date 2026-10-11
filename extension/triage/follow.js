@@ -1,7 +1,7 @@
 // 关注 mode of the 分拣台: UP 主 cards sorted into my own UP tags, and the video feed of the people I follow.
 // The top bar's 收藏夹 | 关注 switch puts body.follow-mode on; follow.css then hides the folder view and this file draws
 // into #followSide and #followMain (the same grid areas as the folder view, so the shared viewer sits beside the list).
-// Data comes from follow-bg.js through follow_* storage and the follow-* messages (see follow-port-contract.md).
+// Data comes from follow-bg.js through follow_* storage and the follow-* messages (the message list is in follow-bg.js's header).
 // Tags live only in this extension (follow_tags / follow_tag_map). B站 writes: 取消关注, 重新关注 and the 关注分组 (新建, 改名,
 // 删除, 移到 / 复制到, ★ 特别关注 which is group -10), see DESIGN 产品决策 · 改 B站 的操作和撤销 for what asks first and what U undoes.
 import "./triage.js"; // runs first: it sets up the page and globalThis.MoonTriage (viewer, toast, confirm dialog)
@@ -285,8 +285,6 @@ function normDays(slow, dead) {
 // A 刷新 finished between two follow_jobs: the 视频投稿 already loaded is older than what it read.
 const syncFinished = (was, now) => Boolean(now?.finishedAt && now.finishedAt !== was?.finishedAt);
 
-const fmtAgo = (sec, now) => UI.fmtAgo(sec, now);
-
 // What 关注 remembers across reloads (follow_view): mode, tab, sort and the sidebar item.
 const viewRecord = (F) => ({ mode: F.mode, tab: F.tab, sort: F.sort, dir: F.dir, side: F.side });
 // O / Enter on an UP card: its newest video that can play here (one with a bvid), or "".
@@ -308,7 +306,7 @@ function favUpMid(up, rows) {
 const T = globalThis.MoonTriage;
 const UI = globalThis.TriageUi;
 const { toast, askConfirm, send } = T;
-const { esc, fmtDate, fmtDuration, fmtCount, cleanTagName, plainClick, img } = UI;
+const { esc, fmtDate, fmtAgo, fmtDuration, fmtCount, cleanTagName, plainClick, img } = UI;
 const KEYS = ["follow_list", "follow_people", "follow_last", "follow_last_wip", "follow_content", "follow_tags", "follow_tag_map", "follow_unfollowed", "follow_jobs", "follow_ai_recent", "follow_stats", "follow_groups"];
 const VIEW_KEY = "follow_view"; // { mode: "fav" | "follow", tab: "ups" | "feed", sort, dir }
 const saveView = () => T.store({ [VIEW_KEY]: viewRecord(F) });
@@ -342,13 +340,12 @@ const F = {
   anchor: "", // the UP a Shift+click picks from: the last one picked
   busy: "", // the B站 write running, e.g. 取消关注中 3/10
   busyN: [0, 0], // its done / total, for the progress pill's bar
-  busyUntil: 0, // B站限流: when it tries the same request again (ms)
   busyStop: false, // 停止 pressed
   recentFilter: false,
   tagState: "", // row 3: "" | "untagged" | "tagged" (in 视频投稿 the video's UP)
   tags: new Set(), // row 4: tag ids, AND; both tabs
   loaded: false,
-  feed: null, // { items, offset, hasMore, loading, error, dry, at }
+  feed: null, // { items, offset, hasMore, loading, error, errorCode, wait, dry, at }; wait: B站限流, waiting "follow-feed" out
   viewing: "",
   viewingMid: "", // the playing video's UP
   hover: "", // the 视频投稿 card under the mouse (bvid), for T
@@ -549,11 +546,11 @@ function renderSync() {
   if (!j.running) {
     // A B站 write (取消关注 3/10…) first, as 收藏夹's batches show theirs here.
     const stop = { attrs: "data-fw-busystop", label: "停止" };
-    const wait = F.busy && UI.waitText(`${F.busy} · B站限流卡住`, Math.ceil((F.busyUntil - Date.now()) / 1000));
+    const wait = F.busy && T.waitOf("follow-write");
     if (wait) return UI.setActivity(pill, { text: wait, stuck: true, btn: stop });
     if (F.busy) return UI.setActivity(pill, { text: F.busy, done: F.busyN[0], total: F.busyN[1], btn: stop });
     const btn = { attrs: 'data-fw="ai"', label: "查看" };
-    if (AI.running) return UI.setActivity(pill, { ...UI.aiActivity(AI), btn });
+    if (AI.running) return UI.setActivity(pill, { ...UI.aiActivity(AI, T.waitOf("follow-ai")), btn });
     return UI.setActivity(pill, AI.proposal && { text: "标签建议待确认", btn });
   }
   const wait = j.hold?.until ? UI.waitText(j.hold.why === "throttled" ? "B站限流卡住" : "网络断了", Math.ceil(j.hold.until - nowSec())) : "";
@@ -596,7 +593,8 @@ function renderAiState() {
 let loginSeen = "";
 function renderLogin() {
   const j = D.jobs || {};
-  const err = F.mode !== "follow" ? "" : [j.running ? "" : j.error, F.feed?.error].find((x) => /登录/.test(x || "")) || "";
+  const login = (code) => BocErrors.action(code) === "login"; // also B站's own -101, passed through by follow-bg.js
+  const err = F.mode !== "follow" ? "" : !j.running && login(j.errorCode) ? j.error : login(F.feed?.errorCode) ? F.feed.error : "";
   if (err !== loginSeen) T.loginBanner(Boolean(err));
   loginSeen = err;
 }
@@ -772,7 +770,7 @@ function renderSel() {
 }
 
 // ----- 视频投稿 -----
-const freshFeed = () => ({ items: [], offset: "", hasMore: true, loading: false, error: "", wait: 0, dry: 0, at: Date.now() });
+const freshFeed = () => ({ items: [], offset: "", hasMore: true, loading: false, error: "", wait: false, dry: 0, at: Date.now() });
 
 // What the 视频投稿 list and its counts go by.
 const feedF = () => ({ side: F.side, q: F.fq, tagState: F.tagState, tags: F.tags });
@@ -855,7 +853,7 @@ function renderFoot(n = feedList(F.feed.items, D, feedF(), null).length) {
   // B站限流: the follow sync's amber pill with the red ⚠ and the countdown, then more() tries again by itself.
   if (f.wait) {
     foot.innerHTML = `<p>${esc(reach)}</p><span class="activity" role="status"></span>`;
-    return UI.setActivity(foot.lastChild, { text: UI.waitText("B站限流卡住", Math.max(1, Math.ceil(f.wait - nowSec()))), stuck: true });
+    return UI.setActivity(foot.lastChild, { text: T.waitOf("follow-feed") || "B站限流卡住", stuck: true });
   }
   // The background holding its queue (risk control, a dropped connection) while this page waits for a page.
   const hold = f.loading && F.hold?.until > nowSec() ? F.hold : null;
@@ -886,16 +884,12 @@ function observeFoot() {
 }
 
 // The background already paused its queue twice before answering THROTTLED; wait its pause again, then go on.
-const FEED_WAIT_SEC = 90; // follow-bg.js FOLLOW_CFG.backoffMs
-function waitFeed(f) {
-  f.wait = nowSec() + FEED_WAIT_SEC;
-  const tick = setInterval(() => {
-    if (F.feed !== f) return clearInterval(tick);
-    if (nowSec() < f.wait) return renderFoot();
-    clearInterval(tick);
-    f.wait = 0;
-    more();
-  }, 1000);
+async function waitFeed(f) {
+  const here = () => F.feed === f;
+  f.wait = true;
+  await T.waitOut("follow-feed", { ms: UI.BILI_HOLD_MS, label: "B站限流卡住" }, here, () => here() && renderFoot());
+  f.wait = false;
+  if (here()) more();
 }
 
 async function more({ byHand = false } = {}) {
@@ -904,13 +898,17 @@ async function more({ byHand = false } = {}) {
   if (byHand) f.dry = 0;
   f.loading = true;
   f.error = "";
+  f.errorCode = null;
   renderFoot();
   const tick = setInterval(() => F.feed === f && F.tab === "feed" && renderFoot(), 1000);
   const r = await send({ type: "follow-feed", offset: f.offset }).finally(() => clearInterval(tick));
   f.loading = false;
   if (F.feed !== f) return;
   if (r.code === "THROTTLED") waitFeed(f);
-  else if (!r.ok) f.error = r.code === "NOT_LOGGED_IN" ? "没登录 B站，登录后点重试" : `读取失败：${r.error || "未知错误"}`;
+  else if (!r.ok) {
+    f.errorCode = r.code;
+    f.error = BocErrors.action(r.code) === "login" ? "没登录 B站，登录后点重试" : `读取失败：${r.error || "未知错误"}`;
+  }
   else {
     const { items, add } = mergeFeed(f.items, r.data.items || []);
     f.items = items;
@@ -937,18 +935,10 @@ function play(bvid) {
 // ---------- B站 writes: one request at a time, stopped by the first error ----------
 // calls = the requests, each with the mids it changes (a relation request one UP, a group request up to 20).
 // Returns how many UP 主 went through. Its progress shows in the row's progress pill, as a 收藏夹 batch does, with 停止.
-// WRITE_GAP_MS between requests, as 收藏夹's batches. B站限流 (THROTTLED): the pill counts down WRITE_WAIT_SEC, amber,
+// WRITE_GAP_MS between requests, as 收藏夹's batches. B站限流 (THROTTLED): the pill counts down UI.BILI_HOLD_MS, amber,
 // then the same request goes again; 停止 ends the run there, keeping what went through (and its undo).
 const WRITE_GAP_MS = 1000;
-const WRITE_WAIT_SEC = 90; // as follow-bg.js FOLLOW_CFG.backoffMs
 const perUp = (mids, msg) => mids.map((mid) => msg(mid));
-// Waits until the time (ms), redrawing the pill each second, or until 停止.
-async function busyWait(until) {
-  while (!F.busyStop && Date.now() < until) {
-    renderSync();
-    await new Promise((r) => setTimeout(r, Math.min(1000, until - Date.now())));
-  }
-}
 async function relationRun(calls, label, { quiet = false } = {}) {
   const midsOf = (c) => c.mids || [c.mid];
   const total = calls.reduce((n, c) => n + midsOf(c).length, 0);
@@ -960,7 +950,7 @@ async function relationRun(calls, label, { quiet = false } = {}) {
   let done = 0;
   try {
     for (const c of calls) {
-      if (done) await busyWait(Date.now() + WRITE_GAP_MS);
+      if (done) await new Promise((r) => setTimeout(r, WRITE_GAP_MS));
       if (F.busyStop) break;
       F.busy = `${label}中 ${Math.min(total, done + midsOf(c).length)}/${total}`;
       F.busyN = [done, total];
@@ -968,10 +958,7 @@ async function relationRun(calls, label, { quiet = false } = {}) {
       renderSync();
       let r = await send(c);
       while (r.code === "THROTTLED" && !F.busyStop) {
-        F.busyUntil = Date.now() + WRITE_WAIT_SEC * 1000;
-        await busyWait(F.busyUntil);
-        F.busyUntil = 0;
-        renderSync();
+        await T.waitOut("follow-write", { ms: UI.BILI_HOLD_MS, label: `${F.busy} · B站限流卡住` }, () => !F.busyStop, renderSync);
         if (!F.busyStop) r = await send(c);
       }
       if (!r.ok && F.busyStop) break;
@@ -1473,7 +1460,8 @@ async function runAi({ instruction, scope, allowRemove }) {
     intervalMs,
     keepGoing: () => !AI.stop,
     progress: (text) => (progress(text), renderSync()),
-    at: AI
+    at: AI,
+    job: "follow-ai"
   });
   AI.running = false;
   setAiProposal(proposal);

@@ -1,6 +1,7 @@
 const SELECTED_PROVIDER_KEY = "boc_ai_selected_provider";
 const CONVERSATIONS_STORAGE_KEY = BocLimits.KEYS.aiConversations;
 const NOTE_PATHS_STORAGE_KEY = BocLimits.KEYS.obsidianNotePaths;
+const { escapeHtml } = BocErrors;
 const {
   stripThinkBlocks,
   normalizeMarkdownForSectionPaste,
@@ -12,7 +13,7 @@ const {
   resolveFolderTemplate,
   buildNoteFilename
 } = BocNote;
-const PLAYER_AI_QUICK_ACTION_STORAGE_KEY = "boc_player_ai_quick_action_v1";
+const PLAYER_AI_QUICK_ACTION_STORAGE_KEY = BocLimits.KEYS.playerAiQuickAction;
 // Marks a control that starts an AI request (tokens.css draws it in the text color).
 const AI_SPARK = '<span class="ai-spark" aria-hidden="true"></span>';
 const NON_VIDEO_CONTEXT_MESSAGE = "这不是支持的视频页。";
@@ -54,7 +55,7 @@ const els = {
   noteText: document.getElementById("spNoteText"),
   noteInput: document.getElementById("spNoteInput"),
 };
-const NOTES_STORAGE_KEY = "triage_notes"; // { [videoId]: { text, updatedAt } }, shared with the triage and video records pages
+const NOTES_STORAGE_KEY = BocLimits.KEYS.triageNotes;
 
 const DEFAULT_AI_PREFS = {
   aiSystemPrompt: "",
@@ -823,7 +824,7 @@ async function renderTriageSummary(node) {
   if (ref?.site !== "bilibili" || ref.pageIndex !== 1) {
     return;
   }
-  const key = `triage_analysis_${ref.videoId}`;
+  const key = BocLimits.KEYS.triageAnalysis(ref.videoId);
   const summary = BocNote.buildTriageSummary((await chrome.storage.local.get(key))[key]);
   if (!summary || node !== suggestionsNode || chatHistory.length || buildConversationContextRef(contextData)?.videoId !== ref.videoId) {
     return;
@@ -2131,30 +2132,27 @@ function endStream(stream, { stopped = "", error = "", code = "" } = {}) {
   scrollToBottom();
 }
 
-// Errors that only a settings change fixes (codes from triageAiHttpError in triage-bg.js): 去设置 comes before 重试.
-const AI_SETTINGS_CODES = new Set(["AI_AUTH", "AI_QUOTA", "AI_SETUP"]);
-
 function appendStreamError({ node, prompt, raw }, error, saved, code = "") {
   const err = document.createElement("div");
   err.className = "sp-msg-error";
   err.textContent = `错误：${error}`;
   node.appendChild(err);
-  const origin = /未授权访问 (https?:\/\/[^\s，]+)/.exec(String(error))?.[1];
-  if (origin) {
+  const access = BocErrors.grantOrigin(error);
+  if (access) {
     const grant = document.createElement("button");
     grant.type = "button";
     grant.className = "sp-chip sp-grant-btn";
-    grant.textContent = `授权访问 ${origin}`;
-    // The click is the user gesture permissions.request needs; the service worker cannot ask.
+    grant.textContent = `授权访问 ${access.origin}`;
     grant.addEventListener("click", async () => {
-      if (await chrome.permissions.request({ origins: [`${origin}/*`] }).catch(() => false)) {
+      if (await access.request()) {
         err.textContent = "已授权，请重新发送";
         grant.remove();
       }
     });
     node.appendChild(grant);
   }
-  if (AI_SETTINGS_CODES.has(code)) {
+  // Errors that only a settings change fixes (codes from triageAiHttpError in triage-bg.js): 去设置 comes before 重试.
+  if (BocErrors.action(code) === "settings") {
     const settings = document.createElement("button");
     settings.type = "button";
     settings.className = "sp-chip sp-grant-btn";
@@ -2280,7 +2278,7 @@ async function buildCurrentConversationNote() {
   const filename = buildAiConversationFilename(context);
   const noteId = noteVideoId(context);
   const ref = buildConversationContextRef(context);
-  const analysisKey = noteId && ref.site === "bilibili" && ref.pageIndex === 1 ? `triage_analysis_${noteId}` : "";
+  const analysisKey = noteId && ref.site === "bilibili" && ref.pageIndex === 1 ? BocLimits.KEYS.triageAnalysis(noteId) : "";
   const stored = noteId ? await chrome.storage.local.get([NOTES_STORAGE_KEY, analysisKey].filter(Boolean)) : {};
   const markdown = buildAiConversationMarkdown({ context, turns, filename });
   return { context, filename, content: BocNote.withTriageSummary(markdown, stored[analysisKey], stored[NOTES_STORAGE_KEY]?.[noteId]?.text) };
@@ -2319,7 +2317,7 @@ async function syncVideoNoteAiSection({ context, messages, settings, baseUrl, ap
   const filepath = await resolveVideoNotePath(context, settings);
   const resp = await sendRuntimeMessage({ type: "update-obsidian-ai-section", baseUrl, apiKey, filepath, section, noteKey });
   if (!resp?.ok) {
-    throw obsidianError(resp, "Local API 写入失败");
+    throw BocErrors.fromResp(resp, "Local API 写入失败");
   }
   return { ...resp, filepath };
 }
@@ -2371,15 +2369,10 @@ async function autoSyncConversation(conversationId) {
   }
 }
 
-// The background's Obsidian failure (already in the user's words); setup: the fix is in the settings page.
-function obsidianError(resp, fallback) {
-  return Object.assign(new Error(getReadableText(resp?.error, fallback)), { setup: resp?.setup === true });
-}
-
-// A failed manual write is red; when Obsidian itself is unusable the settings page opens, as for 未配置.
+// A failed manual write is red; a wrong key opens the settings page, as for 未配置 (a closed Obsidian does not).
 function showObsidianFailure(error) {
   showConversationContextNotice(`写入 Obsidian 失败：${getErrorMessage(error)}`, 4000, { error: true });
-  if (error?.setup) chrome.runtime.openOptionsPage?.();
+  if (error?.action === "settings") chrome.runtime.openOptionsPage?.();
 }
 
 let syncStatusTimer = 0;
@@ -2485,7 +2478,7 @@ async function saveBuiltVideoNoteToObsidian(ref, messages, epoch, settingsBundle
   const built = await sendRuntimeMessage({ type: "triage-build-note", bvid: ref.videoId });
   if (!built?.ok) {
     if (!BocSites.isBiliVideoGone(built?.code)) {
-      throw new Error(built?.code === 62004 ? "视频审核中，过后再试" : getReadableText(built?.error, "生成视频笔记失败"));
+      throw new Error(BocErrors.text(built, "生成视频笔记失败"));
     }
     // The conversation-only note is built from the panel's current conversation.
     if (epoch !== conversationEpoch) {
@@ -2497,25 +2490,13 @@ async function saveBuiltVideoNoteToObsidian(ref, messages, epoch, settingsBundle
     }
     return;
   }
-  const { path: filepath, cover } = built.data;
-  const choice = (await checkObsidianNoteExists(baseUrl, apiKey, filepath)) ? await BocOverwriteDialog.choose(filepath, { hasAiSection: true }) : "full";
+  const section = BocNote.buildAiSection(buildConversationTurns(messages));
+  const choice = await BocOverwriteDialog.writeBuiltNote({ baseUrl, apiKey, built: built.data, section, noteKey: BocSites.buildContextKey(ref) });
   if (!choice) {
     showConversationContextNotice("已取消写入 Obsidian，原笔记未被覆盖。", 2200);
     return;
   }
-  const noteKey = BocSites.buildContextKey(ref);
-  if (choice === "full") {
-    const written = await sendRuntimeMessage({ type: "write-obsidian-note", baseUrl, apiKey, filepath, content: built.data.markdown, cover, noteKey });
-    if (!written?.ok) {
-      throw obsidianError(written, "Local API 写入失败");
-    }
-  }
-  const section = BocNote.buildAiSection(buildConversationTurns(messages));
-  const updated = await sendRuntimeMessage({ type: "update-obsidian-ai-section", baseUrl, apiKey, filepath, section, noteKey });
-  if (!updated?.ok) {
-    throw obsidianError(updated, "Local API 写入失败");
-  }
-  showConversationContextNotice(choice === "full" ? `已写入 Obsidian：${filepath}` : `已更新 AI 问答：${filepath}`, 4000);
+  showConversationContextNotice(`${choice === "full" ? "已写入 Obsidian" : "已更新 AI 问答"}：${built.data.path}`, 4000);
 }
 
 async function loadObsidianSettings() {
@@ -2532,7 +2513,7 @@ async function loadObsidianSettings() {
   const baseUrl = String(settings.obsidianApiBaseUrl || "").trim();
   const apiKey = String(settings.obsidianApiKey || "").trim();
   if (!baseUrl || !apiKey) {
-    showConversationContextNotice("请先在设置页填写 Obsidian Local REST API 地址和 API Key。", 3500);
+    showConversationContextNotice(BocErrors.TEXT.obsidianUnset, 3500);
     chrome.runtime.openOptionsPage?.();
     return null;
   }
@@ -2548,8 +2529,7 @@ async function saveMarkdownToObsidian({ button, filepath, content, baseUrl, apiK
     }
     const exists = await checkObsidianNoteExists(baseUrl, apiKey, filepath);
     if (exists) {
-      const shouldOverwrite = await confirmOverwriteNote(filepath);
-      if (!shouldOverwrite) {
+      if (!(await BocOverwriteDialog.choose(filepath))) {
         showConversationContextNotice("已取消写入 Obsidian，原笔记未被覆盖。", 2200);
         return false;
       }
@@ -2576,7 +2556,7 @@ async function checkObsidianNoteExists(baseUrl, apiKey, filepath) {
     filepath
   });
   if (!resp?.ok) {
-    throw obsidianError(resp, "Local API 检查失败");
+    throw BocErrors.fromResp(resp, "Local API 检查失败");
   }
   return Boolean(resp.exists);
 }
@@ -2590,7 +2570,7 @@ async function writeNoteByLocalApi(baseUrl, apiKey, filepath, content) {
     content
   });
   if (!resp?.ok) {
-    throw obsidianError(resp, "Local API 写入失败");
+    throw BocErrors.fromResp(resp, "Local API 写入失败");
   }
 }
 
@@ -2610,56 +2590,6 @@ function getReadableText(value, fallback = "") {
 
 function getErrorMessage(error, fallback = "未知错误") {
   return getReadableText(error?.message || error, fallback);
-}
-
-let cancelOverwriteNote = null;
-
-function confirmOverwriteNote(filepath) {
-  // A second dialog answers the first with 取消, so its caller does not wait forever.
-  cancelOverwriteNote?.();
-  return new Promise((resolve) => {
-    const overlay = document.createElement("div");
-    overlay.className = "sp-confirm-overlay";
-    overlay.innerHTML = `
-      <div class="sp-confirm-dialog" role="dialog" aria-modal="true" aria-labelledby="spConfirmTitle">
-        <div id="spConfirmTitle" class="sp-confirm-title">该笔记已存在</div>
-        <div class="sp-confirm-body">继续会覆盖原内容：</div>
-        <div class="sp-confirm-path"></div>
-        <div class="sp-confirm-actions">
-          <button type="button" class="sp-confirm-cancel">取消</button>
-          <button type="button" class="sp-confirm-primary">覆盖</button>
-        </div>
-      </div>
-    `;
-    overlay.querySelector(".sp-confirm-path").textContent = String(filepath || "");
-
-    const cleanup = (value) => {
-      cancelOverwriteNote = null;
-      overlay.remove();
-      document.removeEventListener("keydown", onKeydown, true);
-      resolve(value);
-    };
-    const onKeydown = (event) => {
-      if (BocTyping.composing(event)) return;
-      if (event.key === "Escape") {
-        event.preventDefault();
-        cleanup(false);
-      }
-    };
-
-    overlay.addEventListener("click", (event) => {
-      if (event.target === overlay) {
-        cleanup(false);
-      }
-    });
-    overlay.querySelector(".sp-confirm-cancel")?.addEventListener("click", () => cleanup(false));
-    overlay.querySelector(".sp-confirm-primary")?.addEventListener("click", () => cleanup(true));
-    cancelOverwriteNote = () => cleanup(false);
-    document.addEventListener("keydown", onKeydown, true);
-    document.body.appendChild(overlay);
-    // 覆盖 is destructive: Enter on the focused button must not overwrite by default.
-    overlay.querySelector(".sp-confirm-cancel")?.focus();
-  });
 }
 
 function linkifyAssistantTimestamps(root) {
@@ -2906,13 +2836,4 @@ function sendRuntimeMessage(message) {
       resolve(resp);
     });
   });
-}
-
-function escapeHtml(value) {
-  return String(value)
-    .replaceAll("&", "&amp;")
-    .replaceAll("<", "&lt;")
-    .replaceAll(">", "&gt;")
-    .replaceAll('"', "&quot;")
-    .replaceAll("'", "&#39;");
 }

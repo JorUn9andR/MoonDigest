@@ -2,7 +2,7 @@
 // the same numbers the code applies, and the storage key names shared between files. Loaded by the
 // content script (manifest), background (importScripts) and every page. Idempotent like sites.js.
 (() => {
-  if (globalThis.BocLimits) {
+  if (globalThis.MdgLimits) {
     return;
   }
 
@@ -15,19 +15,19 @@
   const TRIAGE_UNDO_STEPS = 20;
 
   // chrome.storage.local key names more than one file uses, written only here; storageUsage counts the capped ones.
-  // Never change a value: the user's data is stored under it. A key built at run time has a function beside its prefix.
+  // Never change a value: the user's data is stored under it (the one rename, in 3.6, ships with migrateRenamedKeys below). A key built at run time has a function beside its prefix.
   // limits.selftest.js fails when a name here is written in another file. badges.js does not load this file and keeps
   // its own copies of the names it reads, which the selftest checks against KEYS.
   const ANALYSIS = "triage_analysis_";
   const TITLE = "triage_title_";
   const SNAPSHOT = "triage_snapshot_";
   const KEYS = Object.freeze({
-    subtitleCachePrefix: "boc_subtitle_cache_",
-    aiConversations: "boc_ai_conversations_v1",
+    subtitleCachePrefix: "mdg_subtitle_cache_",
+    aiConversations: "mdg_ai_conversations_v1",
     // videoKey → { path, lastSyncedAt } for notes the user saved; auto-sync only touches these.
-    obsidianNotePaths: "boc_obsidian_note_paths_v1",
+    obsidianNotePaths: "mdg_obsidian_note_paths_v1",
     // The side panel's request slot: the player button, popup, 分拣台 and 视频记录 ask it to open a video's AI chat.
-    playerAiQuickAction: "boc_player_ai_quick_action_v1",
+    playerAiQuickAction: "mdg_player_ai_quick_action_v1",
     triageAnalysisPrefix: ANALYSIS,
     triageAnalysis: (bvid) => `${ANALYSIS}${bvid}`,
     triageTitlePrefix: TITLE,
@@ -46,6 +46,41 @@
     triageFolderCriteria: "triage_folder_criteria",
     triageSimplified: "triage_simplified_v1"
   });
+
+  // 3.6 renamed every boc_* key (local, session and the extension pages' localStorage) to mdg_*. Old name → new name, or "".
+  const OLD_PREFIX = "boc_";
+  const renamedKey = (key) => (key.startsWith(OLD_PREFIX) ? `mdg_${key.slice(OLD_PREFIX.length)}` : "");
+
+  // Moves each old key to its new name, one key at a time: copy only when the new key is absent (newer data wins),
+  // remove the old key only after the copy is written. A failed write leaves the old key for the next run. Idempotent.
+  async function migrateRenamedKeys(area) {
+    const keys = (await area.getKeys?.()) ?? Object.keys((await area.get(null)) || {});
+    const present = new Set(keys);
+    for (const old of keys.filter(renamedKey)) {
+      try {
+        if (!present.has(renamedKey(old))) {
+          const value = (await area.get(old))[old];
+          if (value !== undefined) await area.set({ [renamedKey(old)]: value });
+        }
+        await area.remove(old);
+      } catch (error) {
+        console.warn("[MDG] storage key not migrated", old, error);
+      }
+    }
+  }
+
+  // The same for a page's localStorage (Storage API), run before the page's first read.
+  function migrateRenamedLocalStorage(ls) {
+    const keys = Array.from({ length: ls.length }, (_, i) => ls.key(i));
+    for (const old of keys.filter(renamedKey)) {
+      try {
+        if (ls.getItem(renamedKey(old)) === null) ls.setItem(renamedKey(old), ls.getItem(old));
+        ls.removeItem(old);
+      } catch (error) {
+        console.warn("[MDG] localStorage key not migrated", old, error);
+      }
+    }
+  }
 
   // Approximate stored size: JSON length of key + value, as chrome.storage counts it (characters, not UTF-8 bytes).
   const sizeOf = (entries) => entries.reduce((sum, [key, value]) => sum + key.length + JSON.stringify(value ?? null).length, 0);
@@ -143,7 +178,7 @@
     ];
   }
 
-  globalThis.BocLimits = Object.freeze({
+  globalThis.MdgLimits = Object.freeze({
     SUBTITLE_CACHE_ENTRIES,
     SUBTITLE_CACHE_DAYS,
     AI_CONVERSATIONS,
@@ -154,6 +189,8 @@
     KEYS,
     storageUsage,
     describe,
-    sampleAiSubtitle
+    sampleAiSubtitle,
+    migrateRenamedKeys,
+    migrateRenamedLocalStorage
   });
 })();

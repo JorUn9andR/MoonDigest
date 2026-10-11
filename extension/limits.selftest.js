@@ -6,7 +6,7 @@ const assert = require("assert");
 
 const ctx = vm.createContext({ console });
 vm.runInContext(fs.readFileSync(path.join(__dirname, "limits.js"), "utf8"), ctx);
-const L = ctx.BocLimits;
+const L = ctx.MdgLimits;
 
 // The options page renders describe(); each cap it states must be the one the code enforces.
 const rows = L.describe({ subtitleCache: 12, aiConversations: 23, triageResults: 7 });
@@ -30,7 +30,7 @@ assert.ok(rows.every((row) => row.label && row.usage && row.rule));
 // vm objects carry another realm's prototypes, so compare through JSON.
 assert.deepStrictEqual(
   JSON.parse(JSON.stringify(L.storageUsage({
-    boc_subtitle_cache_a: {}, boc_subtitle_cache_b: {}, boc_ai_conversations_v1: [{}, {}, {}],
+    mdg_subtitle_cache_a: {}, mdg_subtitle_cache_b: {}, mdg_ai_conversations_v1: [{}, {}, {}],
     triage_analysis_BV1: {}, triage_title_BV1: {}, triage_title_BV2: {}, other: 1,
     triage_snapshot_7: { bvids: [] }, triage_removed: { BV1: {}, BV2: {} }, triage_notes: { BV3: {} }
   }))),
@@ -46,7 +46,7 @@ assert.deepStrictEqual(
 const names = Object.values(L.KEYS).filter((v) => typeof v === "string");
 // Renaming one loses the data stored under it.
 assert.deepStrictEqual([...names].sort(), [
-  "boc_ai_conversations_v1", "boc_obsidian_note_paths_v1", "boc_player_ai_quick_action_v1", "boc_subtitle_cache_",
+  "mdg_ai_conversations_v1", "mdg_obsidian_note_paths_v1", "mdg_player_ai_quick_action_v1", "mdg_subtitle_cache_",
   "triage_analysis_", "triage_basket", "triage_folder_criteria", "triage_included_folders", "triage_notes", "triage_removed",
   "triage_seen_meta", "triage_simplified_v1", "triage_snapshot_", "triage_tags", "triage_title_", "triage_video_tags"
 ]);
@@ -71,9 +71,63 @@ for (const file of sources) {
   for (const name of names) {
     // A string literal ("name", `name${id}`), a property read (x.name) or an object key ({ name: ... }).
     const written = new RegExp(`["'\`]${name}(?:["'\`]|\\$\\{)|\\.${name}\\b|[{,]\\s*${name}\\s*:`);
-    assert.ok(!written.test(text), `${file} writes the storage key ${name} itself; use BocLimits.KEYS`);
+    assert.ok(!written.test(text), `${file} writes the storage key ${name} itself; use MdgLimits.KEYS`);
   }
 }
 for (const name of badgesCopies) assert.ok(fs.readFileSync(path.join(__dirname, "badges.js"), "utf8").includes(name));
 
-console.log("limits selftest ok");
+// The boc_* → mdg_* rename: copy, never overwrite newer data, keep the old key when the write fails, rerun is a no-op.
+(async () => {
+  const fakeArea = (data, failOn = "") => ({
+    data,
+    getKeys: async () => Object.keys(data),
+    get: async (k) => (k in data ? { [k]: data[k] } : {}),
+    set: async (o) => {
+      if (Object.keys(o).includes(failOn)) throw new Error("QUOTA_BYTES");
+      Object.assign(data, o);
+    },
+    remove: async (k) => void delete data[k]
+  });
+  const local = fakeArea({
+    boc_ai_conversations_v1: [{ id: "old" }], boc_subtitle_cache_BV1_9_id_7: { raw: 1 },
+    boc_obsidian_note_paths_v1: { a: 1 }, mdg_obsidian_note_paths_v1: { a: 2 }, boc_player_ai_quick_action_v1: { q: 1 }, triage_tags: []
+  }, "mdg_player_ai_quick_action_v1");
+  await L.migrateRenamedKeys(local);
+  assert.deepStrictEqual(JSON.parse(JSON.stringify(local.data)), {
+    triage_tags: [], mdg_ai_conversations_v1: [{ id: "old" }], mdg_subtitle_cache_BV1_9_id_7: { raw: 1 },
+    mdg_obsidian_note_paths_v1: { a: 2 }, boc_player_ai_quick_action_v1: { q: 1 }
+  }, "copied, the newer mdg_ value kept, the failed one left under its old name");
+  const after = JSON.stringify(local.data);
+  local.set = async (o) => Object.assign(local.data, o);
+  await L.migrateRenamedKeys(local);
+  assert.deepStrictEqual(local.data.mdg_player_ai_quick_action_v1, { q: 1 }, "the next run moves what failed");
+  assert.ok(!("boc_player_ai_quick_action_v1" in local.data));
+  const settled = JSON.stringify(local.data);
+  await L.migrateRenamedKeys(local);
+  assert.strictEqual(JSON.stringify(local.data), settled, "idempotent");
+  assert.notStrictEqual(after, settled);
+
+  const ls = (data, fail = false) => ({
+    data,
+    get length() { return Object.keys(data).length; },
+    key: (i) => Object.keys(data)[i] ?? null,
+    getItem: (k) => (k in data ? data[k] : null),
+    setItem: (k, v) => { if (fail) throw new Error("QuotaExceededError"); data[k] = String(v); },
+    removeItem: (k) => void delete data[k]
+  });
+  const page = ls({ boc_ai_selected_provider: "b", other: "x" });
+  L.migrateRenamedLocalStorage(page);
+  L.migrateRenamedLocalStorage(page);
+  assert.deepStrictEqual(page.data, { other: "x", mdg_ai_selected_provider: "b" });
+  const newer = ls({ boc_ai_selected_provider: "old", mdg_ai_selected_provider: "new" });
+  L.migrateRenamedLocalStorage(newer);
+  assert.deepStrictEqual(newer.data, { mdg_ai_selected_provider: "new" });
+  const full = ls({ boc_ai_selected_provider: "b" }, true);
+  L.migrateRenamedLocalStorage(full);
+  assert.deepStrictEqual(full.data, { boc_ai_selected_provider: "b" });
+
+  console.log("limits selftest ok");
+})().catch((error) => {
+  console.error(error);
+  process.exit(1);
+});

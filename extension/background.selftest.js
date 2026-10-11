@@ -176,6 +176,8 @@ process.on("exit", (code) => {
   assert.deepStrictEqual(noticesFor({ subtitleFailure: "429" }), ["字幕抓取失败，只根据标题、简介和评论回答"]);
   assert.deepStrictEqual(noticesFor({ subtitleFailure: "要登录", subtitleNeedLogin: true }), ["B站要求登录后才提供字幕，只根据标题、简介和评论回答"]);
   assert.deepStrictEqual(noticesFor({ subtitleMarkdown: "字幕" }), [], "with subtitles there is nothing to say");
+  // A subtitle that does not match the video's length is sent with the video page's warning.
+  assert.deepStrictEqual(noticesFor({ subtitleMarkdown: "字幕", subtitleWarning: "字幕时间轴到 06:40，视频长 04:33，字幕时间可能对不上。" }), ["字幕时间轴到 06:40，视频长 04:33，字幕时间可能对不上"]);
 
   // A long subtitle is sampled across the whole video and capped; the model and the user are both told.
   const subtitleLines = Array.from({ length: 4000 }, (_, i) => `\`${i}\` ${"字".repeat(40)}`);
@@ -261,34 +263,62 @@ process.on("exit", (code) => {
   const early = await contextFor("https://www.bilibili.com/video/BV1xx411c7mD/?boc_reader=1", { videoId: "" });
   assert.strictEqual(early.url, "https://www.bilibili.com/video/BV1xx411c7mD/");
 
-  // A history conversation's context rejects another video's subtitle and keeps it out of the shared cache.
+  // A history conversation's context takes the video page's way with a subtitle that does not match the video.
   const local = {};
   ctx.chrome = { storage: { sync: area({}), local: area(local) } };
   const subUrl = "https://aisubtitle.hdslb.com/a.json";
   const sidepanelRoutes = (to) => ({
     "/view/detail": { code: 0, data: { View: { title: "T", aid: 22, cid: 11, duration: 273, pages: [{ cid: 11, page: 1, duration: 273 }] } } },
+    "/nav": { code: -101, data: { wbi_img: { img_url: "https://i0.hdslb.com/bfs/wbi/7cd084941338484aae1ad9425b84077c.png", sub_url: "https://i0.hdslb.com/bfs/wbi/4932caff0ff746eab6f01bf08b70ac45.png" } } },
     "/x/player/wbi/v2": { code: 0, data: { subtitle: { subtitles: [{ id: 5, lan: "ai-zh", lan_doc: "中文", subtitle_url: subUrl }] } } },
     [subUrl]: { body: [{ from: 0, to: 1, content: "a" }, { from: 1, to, content: "b" }] },
     "/reply/main": { code: 0, data: { replies: [] } }
   });
   const historyContext = () => ctx.resolveAiSidepanelContext({ site: "bilibili", videoId: "BVa", cid: "11" });
-  // A subtitle running far past the 273 s video belongs to another video.
+  // A subtitle running far past the 273 s video is still used, with the video page's warning, and not cached.
   let routes = sidepanelRoutes(400);
   // The side panel reads B站 through triage-bg.js's channel (fetch), with the B站 referrer.
   const inits = [];
-  ctx.fetch = async (url, init) => (inits.push(init), { ok: true, status: 200, json: async () => routes[Object.keys(routes).find((part) => url.includes(part))] });
-  await assert.rejects(historyContext(), /时长不匹配/);
+  const urls = [];
+  ctx.fetch = async (url, init) => (inits.push(init), urls.push(url), { ok: true, status: 200, json: async () => routes[Object.keys(routes).find((part) => url.includes(part))] });
+  const mismatched = await historyContext();
+  assert.strictEqual(mismatched.subtitleBody.length, 2);
+  assert.match(mismatched.subtitleMarkdown, /## 字幕/);
+  assert.strictEqual(mismatched.subtitleWarning, "字幕时间轴到 06:40，视频长 04:33，字幕时间可能对不上。");
   assert.deepStrictEqual(Object.keys(local).filter((k) => k.startsWith("boc_subtitle_cache_")), []);
+  // Like the video page, the next track is tried when the chosen one does not match; the match wins, without a warning.
+  const otherUrl = "https://aisubtitle.hdslb.com/b.json";
+  routes = sidepanelRoutes(400);
+  routes["/x/player/wbi/v2"].data.subtitle.subtitles.push({ id: 6, lan: "ai-en", lan_doc: "English", subtitle_url: otherUrl });
+  routes[otherUrl] = { body: [{ from: 0, to: 270, content: "c" }] };
+  const second = await historyContext();
+  assert.deepStrictEqual([second.selectedSubtitleId, second.subtitleWarning, second.subtitleBody.length], ["6", "", 1]);
+  delete local.boc_subtitle_cache_BVa_11_id_6;
+  // Tracks with empty bodies leave the AI the title, description and comments, flagged as a failed fetch.
+  routes = { ...sidepanelRoutes(100), [subUrl]: { body: [] } };
+  const empty = await historyContext();
+  assert.deepStrictEqual([empty.subtitleBody.length, empty.subtitleMarkdown, empty.subtitleFailure], [0, "", "字幕文件为空"]);
   // Speech ending at 100 s (a long silent outro) passes the video page's loose guard, so the side panel takes it too.
   routes = sidepanelRoutes(100);
   const resolved = await historyContext();
   assert.strictEqual(resolved.subtitleBody.length, 2);
+  // As many hot comments as the video page and 分拣台 notes ask for: one count, BocSites.HOT_COMMENTS.
+  assert.ok(urls.some((u) => u.includes("/reply/main") && u.includes(`&ps=${ctx.BocSites.HOT_COMMENTS}&`)) && ctx.BocSites.HOT_COMMENTS === 20);
   // The AI gets the same note the video page sends (BocNote.buildAiContext): front matter and subtitles, no player embed.
   assert.match(resolved.subtitleMarkdown, /^---\ntitle: "T"\n/);
   assert.match(resolved.subtitleMarkdown, /subtitle_lang: "中文"/);
   assert.ok(!/<iframe|player\.bilibili\.com/.test(resolved.subtitleMarkdown), "the AI context carries no player embed");
   assert.match(resolved.subtitleMarkdown, /\n## 字幕\n\n`00:00` a\n`00:01` b$/);
   assert.ok("boc_subtitle_cache_BVa_11_id_5" in local);
+  // Signed like 细看, and risk control on the subtitle list fails the follow-up as a B站 limit, not as 没有字幕.
+  assert.ok(urls.some((u) => u.includes("/x/player/wbi/v2?") && u.includes("w_rid=")));
+  routes = { ...sidepanelRoutes(100), "/x/player/wbi/v2": { code: -352, message: "风控" }, "/x/player/v2": { code: 0, data: { subtitle: { subtitles: [] } } } };
+  await assert.rejects(historyContext(), (e) => e.code === "THROTTLED");
+  // An empty list because B站 wants a login carries the flag the side panel's login sentence reads.
+  routes = { ...sidepanelRoutes(100), "/x/player/wbi/v2": { code: 0, data: { need_login_subtitle: true, subtitle: { subtitles: [] } } } };
+  assert.strictEqual((await historyContext()).subtitleNeedLogin, true);
+  routes = sidepanelRoutes(100);
+  assert.strictEqual((await historyContext()).subtitleNeedLogin, false);
   assert.ok(inits.length && inits.every((i) => i.referrer === "https://www.bilibili.com/" && i.cache === "no-store" && i.credentials === "include"));
 
   // Dead keys go on install and update, the old 已看 mark (triage_watched) among them; the 待播 list stays.

@@ -17,16 +17,6 @@ for (const name of ["supportsThinkingToggle", "obsidianFailure"]) {
 const t = ctx;
 const plain = (x) => JSON.parse(JSON.stringify(x));
 
-// subtitle validation
-const body = (to) => [{ from: 0, to: 1 }, { from: 1, to }];
-assert.strictEqual(t.triageSubtitleValid(body(272.8), 273), true);
-assert.strictEqual(t.triageSubtitleValid(body(283), 273), true);
-assert.strictEqual(t.triageSubtitleValid(body(283.1), 273), false);
-assert.strictEqual(t.triageSubtitleValid(body(136.5), 273), true);
-assert.strictEqual(t.triageSubtitleValid(body(100), 273), false);
-assert.strictEqual(t.triageSubtitleValid([], 273), false);
-assert.strictEqual(t.triageSubtitleValid(null, 273), false);
-
 // Obsidian itself unusable carries code OBSIDIAN, or OBSIDIAN_DOWN when it is not running (both end a 逐个视频笔记 run);
 // one note's own error passes through.
 assert.strictEqual(t.triageObsidianError(vm.runInContext('new TypeError("Failed to fetch")', ctx)).code, "OBSIDIAN_DOWN");
@@ -400,22 +390,36 @@ assert.throws(() => t.triageParseCommand('{"new_tags":[', cmdItems, cmdTags, {})
   assert.strictEqual((await analyze()).source, "subtitle");
   assert.deepStrictEqual(store[subtitleKey].raw, subtitleRaw(272));
 
-  // Another video's subtitle (ends far too early) falls back to comments and is not cached.
+  // A subtitle that does not match the video's length is used with the video page's warning, and is not cached.
   delete store[subtitleKey];
-  routes = { ...baseRoutes(), [subUrl]: subtitleRaw(100) };
-  assert.strictEqual((await analyze()).source, "meta");
+  routes = { ...baseRoutes(), [subUrl]: subtitleRaw(400) };
+  const mismatched = await analyze();
+  assert.deepStrictEqual([mismatched.source, mismatched.subtitleWarning], ["subtitle", "字幕时间轴到 06:40，视频长 04:33，字幕时间可能对不上。"]);
   assert.strictEqual(subtitleKey in store, false);
+  // Without a duration to check against it is used as is, like on the video page.
+  routes = baseRoutes();
+  routes["/view/detail"].data.View.duration = 0;
+  routes["/view/detail"].data.View.pages[0].duration = 0;
+  routes[subUrl] = subtitleRaw(400);
+  const unchecked = await analyze();
+  assert.deepStrictEqual([unchecked.source, unchecked.subtitleWarning], ["subtitle", undefined]);
+  delete store[subtitleKey];
+
+  // Without subtitles the comments are sent.
+  const emptyList = { code: 0, data: { subtitle: { subtitles: [] } } };
+  routes = { ...baseRoutes(), "/x/player/wbi/v2": emptyList };
+  assert.strictEqual((await analyze()).source, "meta");
   assert.ok(prompt.includes("（无可用字幕）\n热门评论：\n1. 评论一"));
 
   // Without subtitles, a comment fetch failure does not fail the analysis.
-  routes = { ...baseRoutes(), [subUrl]: subtitleRaw(100), "/reply/main": new Error("network") };
+  routes = { ...baseRoutes(), "/x/player/wbi/v2": emptyList, "/reply/main": new Error("network") };
   assert.strictEqual((await analyze()).source, "meta");
   assert.ok(prompt.includes("（无可用字幕）\n热门评论：\n无"));
 
   // Subtitles hidden from a logged-out user: judged without them, and the result says why (the card shows it).
   routes = { ...baseRoutes(), "/x/player/wbi/v2": { code: 0, data: { subtitle: { subtitles: [] }, need_login_subtitle: true } } };
   assert.deepStrictEqual([(await analyze()).source, (await analyze()).needLogin], ["meta", true]);
-  routes = { ...baseRoutes(), [subUrl]: subtitleRaw(100) };
+  routes = { ...baseRoutes(), [subUrl]: { body: [] } };
   assert.strictEqual((await analyze()).needLogin, undefined, "a bad subtitle is not a login problem");
 
   // A subtitle up to the cap goes in whole; a longer one is sampled down to the cap.
@@ -472,13 +476,28 @@ assert.throws(() => t.triageParseCommand('{"new_tags":[', cmdItems, cmdTags, {})
   await assert.rejects(buildNote(), (e) => e.code === "THROTTLED" && !t.BocSites.isBiliVideoGone(e.code));
   routes = { ...baseRoutes(), [subUrl]: new Error("network") };
   await assert.rejects(buildNote(), /network/);
-  routes = { ...baseRoutes(), [subUrl]: subtitleRaw(100) };
-  assert.strictEqual((await buildNote()).body.length, 0);
+  // A subtitle that does not match the video's length is kept with the video page's warning, and is not cached.
+  routes = { ...baseRoutes(), [subUrl]: subtitleRaw(400) };
+  const keptNote = await buildNote();
+  assert.deepStrictEqual([keptNote.body.length, keptNote.subtitleWarning], [2, "字幕时间轴到 06:40，视频长 04:33，字幕时间可能对不上。"]);
   assert.strictEqual(subtitleKey in store, false);
   routes = { ...baseRoutes(), "/x/player/wbi/v2": noTracks };
   assert.strictEqual((await buildNote()).body.length, 0);
   routes = baseRoutes();
   assert.strictEqual((await buildNote()).body.length, 2);
+  // Like the video page, the next track is tried when the first does not match the video's length (or fails to load).
+  const enUrl = "https://aisubtitle.hdslb.com/bfs/ai_subtitle/BVa-en.json";
+  const twoTracks = { code: 0, data: { subtitle: { subtitles: [...withTracks.data.subtitle.subtitles, { id: 6, lan: "ai-en", lan_doc: "English", subtitle_url: enUrl }] } } };
+  delete store[subtitleKey];
+  for (const first of [subtitleRaw(400), new Error("network")]) {
+    routes = { ...baseRoutes(), "/x/player/wbi/v2": twoTracks, [subUrl]: first, [enUrl]: subtitleRaw(272) };
+    const built = await buildNote();
+    assert.deepStrictEqual([built.body.length, built.noteMeta.selectedSubtitleLang], [2, "English"]);
+  }
+  // Without chapters from the player, the description's timestamps give them, as on the video page.
+  routes = baseRoutes();
+  routes["/view/detail"].data.View.desc = "00:00 开场\n01:30 正题";
+  assert.match((await buildNote()).markdown, /## 章节\n\n[^\n]*开场[\s\S]*正题/);
 
   // triage-build-note gives the side panel and 视频记录 the path and cover triage writes with: {{author}} and
   // {{upload_date}} need the API meta, and the cover is downloaded into the vault.
@@ -495,6 +514,10 @@ assert.throws(() => t.triageParseCommand('{"new_tags":[', cmdItems, cmdTags, {})
   store.triage_notes = { BVa: { text: "视频笔记", updatedAt: 1 } };
   const noted = (await buildNote()).markdown;
   assert.ok(noted.includes("## 我的备注\n\n视频笔记") && !noted.includes("篮子里的旧笔记"));
+  // The 分拣 tags go into the note's tags, read the same way as on the video page (BocNote.triageExtras).
+  store.triage_tags = [{ id: "t1", name: "好看" }];
+  store.triage_video_tags = { BVa: ["t1", "t1"] };
+  assert.match((await buildNote()).markdown, /\ntags: \["好看"\]\n/);
 
   // Migration: copies non-empty basket notes, never overwrites, keeps the basket, runs once.
   for (const k of Object.keys(store)) delete store[k];

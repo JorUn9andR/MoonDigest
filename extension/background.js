@@ -314,8 +314,9 @@ async function resolveAiSidepanelContext(contextRef) {
   }
 
   const settings = await getMergedSettings();
-  // Only bilibili gets here (YouTube is pageOnly): triage-bg.js's B站 channel, one try, codes left to sites.js.
-  const io = { fetchJson: (url) => triageBiliGetJson(url) };
+  // Only bilibili gets here (YouTube is pageOnly): the channel 细看 and 分拣台 notes read through (signed, one try,
+  // risk control as THROTTLED), so a B站 limit fails the follow-up as a limit instead of reading as 没有字幕.
+  const io = TRIAGE_BILI_IO;
   const meta = await site.fetchMeta(videoRef, io);
   const bundle = await site.fetchTracks(videoRef, meta, io);
   const tracks = BocSites.rankTracks(bundle.tracks || []);
@@ -324,21 +325,19 @@ async function resolveAiSidepanelContext(contextRef) {
     previousUrl: ref.selectedSubtitleUrl,
     previousLang: ref.subtitleLang
   });
-  // Same duration guard as the video page, so another video's subtitle is neither shown nor cached.
-  const valid = (segments) => BocSites.validateSubtitleByDuration(segments, meta.duration).ok;
-  const body = selectedTrack
-    ? site.parseSegments(await BocSites.fetchRawCached(site, selectedTrack, { videoId: videoRef.id, cid: meta.cid }, io, valid))
-    : [];
-  if (selectedTrack && !valid(body)) {
-    throw new Error(body.length ? "原视频字幕与视频时长不匹配" : "原视频字幕为空");
-  }
+  // Like the video page: the chosen track first, then the others (BocSites.loadFirstTrack). A fetch error with nothing
+  // usable fails the follow-up; tracks with only empty bodies leave the AI the title, description and comments.
+  const ordered = selectedTrack ? [selectedTrack, ...tracks.filter((item) => item !== selectedTrack)] : [];
+  const found = await BocSites.loadFirstTrack(site, ordered, { videoId: videoRef.id, cid: meta.cid }, io, meta.duration);
+  if (!found.track && found.error) throw found.error;
+  const { track, body } = found;
+  const subtitleWarning = found.mismatch ? BocNote.subtitleMismatchWarning(found.mismatch) : "";
 
-  const hotComments = site.fetchComments ? await site.fetchComments(videoRef, meta, io, 18).catch(() => []) : [];
-  const chapters = BocSites.normalizeChapters(bundle.chapters?.length ? bundle.chapters : BocSites.parseChaptersFromDescription(meta.description));
+  const hotComments = site.fetchComments ? await site.fetchComments(videoRef, meta, io).catch(() => []) : [];
   const title = String(meta.title || ref.title || "").trim();
-  const subtitleLang = String(selectedTrack?.label || selectedTrack?.lang || "").trim();
   // The same note the video page sends (content.js buildSidepanelContext), with the fields its state carries.
-  const noteMeta = { ...meta, title, site: site.id, videoId: videoRef.id, chapters, videoDuration: meta.duration, videoTags: meta.tags || [], selectedSubtitleLang: subtitleLang };
+  const noteMeta = { ...BocNote.noteMetaOf({ site: site.id, videoId: videoRef.id, meta, bundle, track }), title };
+  const subtitleLang = noteMeta.selectedSubtitleLang;
   const noteRef = { site: site.id, id: videoRef.id, part: { index: meta.pageIndex || 1, cid: meta.cid }, url: canonicalVideoUrl({ ...meta, site: site.id, videoId: videoRef.id }) };
   return {
     title,
@@ -353,15 +352,19 @@ async function resolveAiSidepanelContext(contextRef) {
     pageTitle: String(meta.pageTitle || ref.pageTitle || "").trim(),
     description: String(meta.description || ""),
     subtitleLang,
-    selectedSubtitleId: String(selectedTrack?.id || "").trim(),
-    selectedSubtitleUrl: String(selectedTrack?.url || "").trim(),
+    selectedSubtitleId: String(track?.id || "").trim(),
+    selectedSubtitleUrl: String(track?.url || "").trim(),
     subtitleBody: body,
+    subtitleWarning,
+    subtitleFailure: ordered.length && !body.length ? "字幕文件为空" : "",
     subtitleMarkdown: body.length ? BocNote.buildAiContext(noteMeta, body, settings, noteRef) : "",
     subtitleOptions: tracks.map((item) => ({
       id: String(item.id || "").trim(),
       url: String(item.url || "").trim(),
       lang: String(item.label || item.lang || "").trim()
     })),
+    // No list because B站 wants a login: the side panel says so instead of 没有字幕, like on the video page.
+    subtitleNeedLogin: bundle.needLogin === true,
     hotComments,
     isVideoContext: true
   };
@@ -382,7 +385,7 @@ async function resolveAiSidepanelPageRef(contextRef) {
   if (!site || site.pageOnly) {
     return fallback;
   }
-  const meta = await site.fetchMeta(videoRef, { fetchJson: (url) => triageBiliGetJson(url) });
+  const meta = await site.fetchMeta(videoRef, TRIAGE_BILI_IO);
   return {
     ...fallback,
     url: canonicalVideoUrl({ ...meta, site: site.id, videoId: videoRef.id }),
@@ -1067,6 +1070,10 @@ function buildAiMessages({ context, userPrompt, history, systemPrompt }) {
     if (description) {
       sections.push(`以下是视频简介：\n\n${description}`);
     }
+  }
+  // The video page's warning for a subtitle whose time range does not match the video (sent anyway, as there).
+  if (subtitle.text && ctx.subtitleWarning) {
+    notices.push(String(ctx.subtitleWarning).replace(/。$/, ""));
   }
   if (Array.isArray(ctx.hotComments) && ctx.hotComments.length) {
     const block = ctx.hotComments

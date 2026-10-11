@@ -6,7 +6,7 @@
 if (!globalThis.__BOC_CONTENT_SCRIPT_LOADED__ && (window === window.top || document.documentElement.hasAttribute("data-mdg-viewer"))) {
 // Only for when get-settings fails; the background owns the stored settings.
 const DEFAULT_SETTINGS = { ...BocSettings.DEFAULTS, ...BocSettings.LOCAL_DEFAULTS };
-const { formatCompactTimestamp, buildSubtitlePreview, buildSrt, buildTxt, shouldShowHoursInNote } = BocNote;
+const { formatCompactTimestamp, buildSubtitlePreview, buildSrt, buildTxt, shouldShowHoursInNote, subtitleMismatchWarning } = BocNote;
 const subtitleCache = BocSites.subtitleCache;
 const { escapeHtml } = BocErrors;
 
@@ -543,7 +543,7 @@ function bindRuntimeEvents() {
       }
 
       const runId = state.fetchRunId;
-      fetchHotComments(20)
+      fetchHotComments()
         .then((hotComments) => {
           if (runId === state.fetchRunId) {
             state.hotComments = hotComments;
@@ -607,7 +607,8 @@ function bindSettingsWatcher() {
         rebuildDerivedContent();
       });
     }
-    if ((changes[BocLimits.KEYS.triageAnalysis(state.videoId)] || changes[BocLimits.KEYS.triageNotes]) && state.markdown) {
+    const extrasRef = { site: state.site, videoId: state.videoId, pageIndex: state.pageIndex };
+    if (BocNote.triageExtrasKeys(extrasRef).some((key) => changes[key]) && state.markdown) {
       loadTriageExtras().then((extras) => {
         if (runId !== state.fetchRunId) return;
         state.triageExtras = extras;
@@ -996,6 +997,7 @@ function buildSidepanelContext() {
       subtitleMarkdown,
       subtitleFailure: state.subtitleFailure,
       subtitleNeedLogin: state.subtitleFailure === SUBTITLE_NEED_LOGIN,
+      subtitleWarning: state.subtitleWarning || "",
       subtitleLang: state.selectedSubtitleLang || "",
       selectedSubtitleId: state.selectedSubtitleId || "",
       selectedSubtitleUrl: state.selectedSubtitleUrl || "",
@@ -1353,11 +1355,6 @@ async function commitSubtitleBody(raw, { url, lang, subtitleId }, runId, { allow
     renderReadingView();
     syncReadingViewPlayback(true);
   }
-}
-
-function subtitleMismatchWarning({ maxTo, videoDuration }) {
-  const withHours = Math.max(maxTo, videoDuration) >= 3600;
-  return `字幕时间轴到 ${formatCompactTimestamp(maxTo, withHours)}，视频长 ${formatCompactTimestamp(videoDuration, withHours)}，字幕时间可能对不上。`;
 }
 
 // The duration mismatch behind an error, if any: thrown by one track, or attached by tryLoadSubtitleCandidates.
@@ -4133,13 +4130,13 @@ async function fetchSubtitleBundle(extraIo = {}) {
   return { tracks: bundle.tracks, chapters, needLogin: bundle.needLogin };
 }
 
-async function fetchHotComments(count = 20) {
+async function fetchHotComments() {
   const site = currentSite();
   const ref = currentRef();
   if (!site?.fetchComments || !ref) {
     return [];
   }
-  return site.fetchComments(ref, state.meta, siteIo(), count);
+  return site.fetchComments(ref, state.meta, siteIo());
 }
 
 function toReadableText(value, fallback = "") {
@@ -4488,17 +4485,14 @@ async function loadAiTurns() {
   }
 }
 
-// The triage page's summary and the video's note, so this note matches what triage exports for the video.
-// The note is per video id on every site and part; the analysis is per bvid and summarizes P1, so only B 站 P1 gets it.
+// The 分拣台 summary, the video's 我的备注 and its 分拣 tags, so this note matches what 分拣台 writes for the video.
 async function loadTriageExtras() {
   if (!state.videoId) {
     return null;
   }
   try {
-    const notesKey = BocLimits.KEYS.triageNotes;
-    const analysisKey = state.site === "bilibili" && !(Number(state.pageIndex) > 1) ? BocLimits.KEYS.triageAnalysis(state.videoId) : "";
-    const stored = await chrome.storage.local.get([analysisKey, notesKey].filter(Boolean));
-    return { analysis: analysisKey ? stored[analysisKey] : null, note: stored[notesKey]?.[state.videoId]?.text || "" };
+    const ref = { site: state.site, videoId: state.videoId, pageIndex: state.pageIndex };
+    return BocNote.triageExtras(await chrome.storage.local.get(BocNote.triageExtrasKeys(ref)), ref);
   } catch (error) {
     logWarn("[BOC] failed to load triage summary for note export", error);
     return null;
@@ -4509,7 +4503,11 @@ function rebuildDerivedContent() {
   const body = Array.isArray(state.subtitleBody) ? state.subtitleBody : [];
   state.markdown =
     body.length || state.subtitleFetchState === "empty"
-      ? BocNote.withTriageSummary(BocNote.buildMarkdown(state, body, state.settings, currentRef()), state.triageExtras?.analysis, state.triageExtras?.note)
+      ? BocNote.withTriageSummary(
+          BocNote.buildMarkdown({ ...state, userTags: state.triageExtras?.userTags }, body, state.settings, currentRef()),
+          state.triageExtras?.analysis,
+          state.triageExtras?.note
+        )
       : "";
   state.srt = body.length ? buildSrt(body) : "";
   state.txt = body.length ? buildTxt(body, state.settings) : "";
@@ -4525,7 +4523,7 @@ async function refreshDerivedContent() {
     const shouldFetchComments = !Array.isArray(hotComments) || hotComments.length === 0;
     if (shouldFetchComments) {
       try {
-        hotComments = await fetchHotComments(20);
+        hotComments = await fetchHotComments();
       } catch (error) {
         hotComments = [];
         logWarn("[BOC] failed to fetch hot comments for note export", error);

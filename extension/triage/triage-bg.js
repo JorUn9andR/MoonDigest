@@ -4,13 +4,6 @@
 
 // ===== 纯函数 =====
 
-// 防止拿到别的视频的字幕：最后一句结束时间要落在 [dur*0.5, dur+10]
-function triageSubtitleValid(body, dur) {
-  if (!Array.isArray(body) || !body.length || !(dur > 0)) return false;
-  const lastTo = Number(body[body.length - 1].to);
-  return lastTo <= dur + 10 && lastTo >= dur * 0.5;
-}
-
 // 从模型输出里取第一个完整的 {...} 或 [...]（去掉 ``` 围栏，跳过字符串里的括号）
 function triageExtractJson(content, open) {
   const close = open === "[" ? "]" : "}";
@@ -566,19 +559,12 @@ async function triageAnalyze({ bvid, force, criteria, folder }) {
   let source = "meta";
   let subtitle = "";
   const found = await site.fetchTracks(ref, m, TRIAGE_BILI_IO);
-  const track = BocSites.pickPreferredTrack(BocSites.rankTracks(found.tracks), {});
-  if (track) {
-    const valid = (body) => triageSubtitleValid(body, m.duration);
-    const raw = await BocSites.fetchRawCached(site, track, { videoId: bvid, cid: m.cid }, TRIAGE_BILI_IO, valid).catch((e) => {
-      // Throttling must reach the page so it backs off; other failures fall back to comments.
-      if (e?.code === "THROTTLED") throw e;
-      return null;
-    });
-    const body = raw ? site.parseSegments(raw) : [];
-    if (valid(body)) {
-      source = "subtitle";
-      subtitle = BocLimits.sampleAiSubtitle(body.map((l) => l.content).join("\n")).text;
-    }
+  // Throttling reaches the page so it backs off; other failures fall back to comments. A subtitle that does not
+  // match the video's length is used with the video page's warning, as everywhere else.
+  const got = await BocSites.loadFirstTrack(site, BocSites.rankTracks(found.tracks), { videoId: bvid, cid: m.cid }, TRIAGE_BILI_IO, m.duration);
+  if (got.body.length) {
+    source = "subtitle";
+    subtitle = BocLimits.sampleAiSubtitle(got.body.map((l) => l.content).join("\n")).text;
   }
   const comments = subtitle ? "" : (await site.fetchComments(ref, m, TRIAGE_BILI_IO, 10).catch(() => [])).map((c, i) => `${i + 1}. ${c.message}`).join("\n");
 
@@ -590,6 +576,7 @@ async function triageAnalyze({ bvid, force, criteria, folder }) {
     source,
     // Bilibili hides subtitles from a logged-out user; the card says so.
     ...(source === "meta" && found.needLogin ? { needLogin: true } : {}),
+    ...(got.mismatch ? { subtitleWarning: BocNote.subtitleMismatchWarning(got.mismatch) } : {}),
     ...triageParseLlm(content),
     model,
     analyzedAt: Date.now(),
@@ -720,49 +707,32 @@ async function triageBuildNote(bvid, settings) {
   const ref = { site: "bilibili", id: bvid, part: null, url: "" };
   const meta = await site.fetchMeta(ref, io);
   ref.url = site.canonicalUrl(bvid, meta.pageCount > 1 ? meta.pageIndex : 1);
-  // Throttling and fetch failures reject so no subtitle-less note is written; another video's subtitle is dropped.
+  // Tracks are tried in order like on the video page (BocSites.loadFirstTrack). Throttling, or a fetch failure with no
+  // track to use, rejects so no subtitle-less note is written; a subtitle that does not match the video's length is
+  // kept with the video page's warning (subtitleWarning), which the callers show.
   const bundle = await site.fetchTracks(ref, meta, io);
-  const track = BocSites.pickPreferredTrack(BocSites.rankTracks(bundle.tracks || []), {});
-  const valid = (segments) => triageSubtitleValid(segments, meta.duration);
-  const fetched = track ? site.parseSegments(await BocSites.fetchRawCached(site, track, { videoId: bvid, cid: meta.cid }, io, valid)) : [];
-  const body = valid(fetched) ? fetched : [];
+  const found = await BocSites.loadFirstTrack(site, BocSites.rankTracks(bundle.tracks || []), { videoId: bvid, cid: meta.cid }, io, meta.duration);
+  if (!found.track && found.error) throw found.error;
+  const { track, body } = found;
+  const subtitleWarning = found.mismatch ? BocNote.subtitleMismatchWarning(found.mismatch) : "";
   const hotComments =
-    settings.includeHotCommentsInNote || !body.length ? await site.fetchComments(ref, meta, io, 20).catch(() => []) : [];
-  const noteMeta = {
-    site: "bilibili",
-    videoId: bvid,
-    cid: meta.cid,
-    aid: meta.aid,
-    title: meta.title,
-    author: meta.author,
-    authorUrl: meta.authorUrl,
-    uploadDate: meta.uploadDate,
-    description: meta.description,
-    videoDuration: meta.duration,
-    cover: meta.cover,
-    videoTags: meta.tags,
-    selectedSubtitleLang: track ? track.label || track.lang : "",
-    chapters: bundle.chapters || [],
-    hotComments,
-    pageIndex: meta.pageIndex,
-    pageCount: meta.pageCount,
-    pageTitle: meta.pageTitle
-  };
-  const { aiConversations, triageNotes, triageTags, triageVideoTags } = BocLimits.KEYS;
-  const cacheKey = BocLimits.KEYS.triageAnalysis(bvid);
-  const stored = await chrome.storage.local.get([cacheKey, aiConversations, triageNotes, triageTags, triageVideoTags]);
-  const analysis = stored[cacheKey];
+    settings.includeHotCommentsInNote || !body.length ? await site.fetchComments(ref, meta, io).catch(() => []) : [];
+  const noteMeta = { ...BocNote.noteMetaOf({ site: "bilibili", videoId: bvid, meta, bundle, track }), hotComments };
+  const { aiConversations } = BocLimits.KEYS;
+  // 分拣台 notes always summarize the video's P1 (the analysis is per bvid).
+  const extrasRef = { site: "bilibili", videoId: bvid, pageIndex: 1 };
+  const stored = await chrome.storage.local.get([aiConversations, ...BocNote.triageExtrasKeys(extrasRef)]);
+  const { analysis, note, userTags } = BocNote.triageExtras(stored, extrasRef);
   // The user's 分拣 tags, every folder's, go into the note's tags next to the fixed ones from the settings page.
-  const tagNames = new Map((stored[triageTags] || []).map((t) => [t.id, t.name]));
-  noteMeta.userTags = [...new Set((stored[triageVideoTags]?.[bvid] || []).map((id) => tagNames.get(id)).filter(Boolean))];
+  noteMeta.userTags = userTags;
   noteMeta.aiTurns = BocNote.buildConversationTurns(BocNote.pickConversation(stored[aiConversations], noteMeta)?.messages);
-  const markdown = BocNote.withTriageSummary(BocNote.buildMarkdown(noteMeta, body, settings, ref), analysis, stored[triageNotes]?.[bvid]?.text);
+  const markdown = BocNote.withTriageSummary(BocNote.buildMarkdown(noteMeta, body, settings, ref), analysis, note);
   // Every writer of this note uses this path and downloads this cover into the vault (hdslb links 403 in Obsidian).
   const folder = BocNote.resolveFolderTemplate(settings.noteFolder, noteMeta);
   const filename = BocNote.buildNoteFilename(noteMeta, settings);
   const path = folder ? `${folder}/${filename}` : filename;
   const cover = { url: meta.cover, name: `bilibili-${bvid}` };
-  return { meta, noteMeta, body, markdown, filename, path, cover };
+  return { meta, noteMeta, body, markdown, filename, path, cover, subtitleWarning };
 }
 
 // Code OBSIDIAN: Obsidian is not usable (off, not set up, wrong key), so every later note fails the same way.
@@ -855,8 +825,8 @@ const TRIAGE_HANDLERS = {
   "triage-obsidian-check": () => triageObsidianCheck(),
   "triage-build-note": async ({ bvid }) => {
     const settings = await getMergedSettings();
-    const { meta, markdown, filename, path, cover } = await triageBuildNote(bvid, settings);
-    return { title: meta.title, markdown, filename, path, cover };
+    const { meta, markdown, filename, path, cover, subtitleWarning } = await triageBuildNote(bvid, settings);
+    return { title: meta.title, markdown, filename, path, cover, subtitleWarning };
   },
   "triage-folders": () => triageCreatedFolders(),
 

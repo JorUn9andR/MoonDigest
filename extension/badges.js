@@ -237,8 +237,9 @@
   let seenCfg = seenConfig(SEEN_DEFAULTS);
   const seenCache = new Map(); // bvid -> percent | 0
   const SEL = 'a[href*="/video/BV"], a[href*="bvid=BV"]';
-  // Keys that every video's info depends on; a per-video title or analysis only redraws that video.
-  const isSharedKey = (k) => k === "triage_tags" || k === "triage_video_tags" || k === "triage_kept" || k.startsWith("triage_decisions_") || k.startsWith("triage_snapshot_");
+  // Keys that every video's info depends on; a per-video title or analysis only redraws that video. Only a favorites
+  // page reads a snapshot, and only its own folder's: the 分拣台 saves other folders' snapshots often.
+  const isSharedKey = (k) => k === "triage_tags" || k === "triage_video_tags" || k === "triage_kept" || k.startsWith("triage_decisions_") || (!!favFid() && k === `triage_snapshot_${favFid()}`);
 
   const cache = new Map(); // bvid -> info | null
   let shared = null;
@@ -624,7 +625,10 @@ input { box-sizing: border-box; width: 100%; margin: 0; padding: 4px 8px; border
     };
     const head = el("div", "h", `给「${pick.add.dataset.name}」打 UP 标签`);
     // The extension reloaded under this page: storage and messages no longer reach it.
-    if (!chrome.runtime?.id) return pick.panel.replaceChildren(head, el("div", "empty", "扩展刚刚更新，请刷新网页"));
+    if (!chrome.runtime?.id) {
+      pick.panel.replaceChildren(head, el("div", "empty", "扩展刚刚更新，请刷新网页"));
+      return placePick();
+    }
     const was = pick.root.activeElement;
     const focus = pick.focus ?? (was?.dataset?.id || (was?.classList?.contains("opt") ? "new" : was ? "input" : null));
     pick.focus = null;

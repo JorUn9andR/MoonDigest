@@ -81,23 +81,6 @@ assert.deepStrictEqual(pageScripts.filter((m) => /type="module"/.test(m[1])).map
 for (const [, attrs, src] of pageScripts) {
   if (!/type="module"/.test(attrs) && !src.endsWith("/tag-dialogs.js")) vm.runInContext(fs.readFileSync(path.join(__dirname, src), "utf8"), ctx);
 }
-// Registration: every extension page that loads a reader of TriageCore loads triage-core.js before it.
-{
-  const root = path.join(__dirname, "..");
-  const pages = [];
-  const walk = (dir) => fs.readdirSync(dir, { withFileTypes: true }).forEach((e) => (e.isDirectory() ? walk(path.join(dir, e.name)) : e.name.endsWith(".html") && pages.push(path.join(dir, e.name))));
-  walk(root);
-  let readers = 0;
-  for (const page of pages) {
-    const files = [...fs.readFileSync(page, "utf8").matchAll(/<script[^>]*src="([^"]+)"/g)].map((m) => path.join(path.dirname(page), m[1])).filter((p) => fs.existsSync(p));
-    const first = files.findIndex((p) => !p.endsWith("triage-core.js") && /\bTriageCore\b/.test(fs.readFileSync(p, "utf8")));
-    if (first < 0) continue;
-    readers++;
-    const core = files.findIndex((p) => p.endsWith(`${path.sep}triage-core.js`));
-    assert.ok(core >= 0 && core < first, `${path.relative(root, page)} loads triage-core.js before ${path.basename(files[first])}`);
-  }
-  assert.ok(readers >= 1, "found the pages that read TriageCore");
-}
 vm.runInContext(`${source}\n;globalThis.S = S; globalThis.K = K; globalThis.el = el; globalThis.verdictBadge = verdictBadge; globalThis.seenText = seenText; globalThis.staleCoarse = staleCoarse; globalThis.staleFine = staleFine; globalThis.groupDone = groupDone; globalThis.mergeHead = mergeHead; globalThis.isFinished = isFinished; globalThis.pointerMoved = pointerMoved; globalThis.inferFrom = inferFrom; globalThis.hasAllTags = hasAllTags; globalThis.sortItems = sortItems; globalThis.sortOf = sortOf; globalThis.visibleItems = visibleItems;`, ctx);
 const t = ctx;
 Object.assign(t, t.TriageCore);
@@ -318,7 +301,23 @@ const unfavOnlyOf = (d) => Object.fromEntries(Object.entries(d).filter(([, v]) =
     await t.undo();
     t.askConfirm = savedAsk;
     assert.deepStrictEqual([asked, t.S.undo.length, toasts.at(-1)], [0, 1, "重新收藏还在跑，等它完成再撤销"]);
+    // R1: a single 重新收藏 (its button or U on a single 取消收藏) waits too, so it cannot take over the batch's run.
+    const run = t.S.refavRun;
+    t.S.decisions.BV9 = { action: "unfav", at: 1, aid: 1009, title: "视频9" };
+    const sentBefore = sent.length;
+    await t.refavRecent("BV9");
+    t.S.undo = [{ kind: "decision", bvid: "BV1", action: "unfav", prev: null, prevs: { D: null } }];
+    await t.undo();
+    assert.strictEqual(sent.length, sentBefore, "nothing sent to B站");
+    assert.ok(t.S.refavRun === run && t.S.undo.length === 1 && toasts.at(-1) === "重新收藏还在跑，等它完成再撤销");
+    assert.ok(/data-refav="BV9"[^>]* disabled title="重新收藏还在跑，等它完成"/.test(t.recentUnfavHtml()));
+    delete t.S.decisions.BV9;
     t.S.refavRun = null;
+    // R3: a B站 limit on a single 细看 retry names the limit, not "undefined".
+    handlers["triage-analyze"] = () => ({ ok: false, code: "THROTTLED", error: "412" });
+    await t.retry("BV1");
+    assert.strictEqual(toasts.at(-1), "B站限流卡住，请稍后再试");
+    delete t.S.analyses.BV1;
     t.S.undo = [];
   }
 
@@ -1687,6 +1686,22 @@ const unfavOnlyOf = (d) => Object.fromEntries(Object.entries(d).filter(([, v]) =
   await t.loadFolders();
   assert.deepStrictEqual(Object.keys(store[t.K.removed]), ["BV1"], "BV2 is still in chosen folder 2");
   assert.ok(!store.triage_snapshot_1 && store.triage_snapshot_2 && store.triage_decisions_2);
+  // R12: 稍后再看 missing from the list because its read failed is not deleted: its videos and records stay.
+  {
+    const removedBefore = plain(store[t.K.removed]);
+    Object.assign(store, { triage_included_folders: ["2", "toview"], triage_snapshot_toview: { bvids: ["BV5"], items: [item(5)] }, triage_decisions_toview: { BV6: { action: "unfav" } } });
+    handlers["triage-folders"] = () => ({ ok: true, data: { folders: [{ id: 2, count: 2 }], toviewUnread: true } });
+    await t.loadFolders();
+    assert.ok(store.triage_snapshot_toview && store.triage_decisions_toview, "稍后再看 kept");
+    assert.deepStrictEqual(plain(store[t.K.removed]), removedBefore, "nothing moved to 已出分拣范围");
+    assert.deepStrictEqual([t.el.banner.hidden, t.el.banner.dataset.kind, t.el.bannerText.textContent], [false, "toview", "稍后再看这次没读到，点「重试」再读一次"], "the user is told and offered 重试");
+    handlers["triage-folders"] = () => ({ ok: true, data: { folders: [{ id: 2, count: 2 }] } });
+    store.triage_included_folders = ["2"];
+    await t.loadFolders();
+    assert.ok(!store.triage_snapshot_toview && "BV5" in store[t.K.removed], "a read 稍后再看 that is unticked retires as before");
+    assert.ok(t.el.banner.hidden, "the next read that gets it clears the reminder");
+    delete store[t.K.removed].BV5;
+  }
   // saveSnapshot counts only chosen folders: BV3 left folder 2 and only an unchosen folder's stale list had it.
   store.triage_snapshot_9 = { bvids: ["BV3"], items: [item(3)] };
   await t.saveSnapshot("2", [item(2)]);

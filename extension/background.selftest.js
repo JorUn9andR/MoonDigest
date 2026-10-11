@@ -209,6 +209,13 @@ process.on("exit", (code) => {
   out = await chat();
   assert.deepStrictEqual(out.map((m) => m.type), ["token", "error"]);
   assert.deepStrictEqual([out[1].error, out[1].code], ["AI 平台余额不足或额度已用完，请充值或换一个平台", "AI_QUOTA"]);
+  // A per-minute quota in the stream is 限流, as it is over HTTP 429 (Gemini's wording).
+  ctx.fetch = streamingFetch([
+    { after: 5, chunk: new TextEncoder().encode(`data: ${JSON.stringify({ error: { message: "Quota exceeded for metric: requests per minute" } })}\n\n`) },
+    { after: 0, done: true }
+  ]);
+  out = await chat();
+  assert.deepStrictEqual([out[0].error, out[0].code], ["AI 平台限流", "AI_THROTTLED"]);
 
   // HTTP and network errors reach the panel in Chinese with the 分拣台's code, never the body.
   ctx.fetch = async () => ({ ok: false, status: 401, text: async () => '{"error":{"message":"Incorrect API key provided"}}' });
@@ -219,6 +226,18 @@ process.on("exit", (code) => {
   };
   out = await chat();
   assert.deepStrictEqual([out[0].error, out[0].code], ["连不上 AI 平台，请检查网络和接口地址", "AI_NETWORK"]);
+
+  // Setup the settings page fixes (key, base URL, model) carries a code, so the panel offers 去设置, not only 重试.
+  const setupError = async (provider) => {
+    const was = ctx.loadAiProviders;
+    ctx.loadAiProviders = async () => [{ id: "p", baseUrl: "https://ai.test", model: "m", requiresKey: false, ...provider }];
+    const [m] = await chat();
+    ctx.loadAiProviders = was;
+    return [m.error, m.code];
+  };
+  assert.deepStrictEqual(await setupError({ requiresKey: true }), ["该平台 API Key 未配置", "AI_AUTH"]);
+  assert.deepStrictEqual(await setupError({ baseUrl: "" }), ["接口地址未配置", "AI_SETUP"]);
+  assert.deepStrictEqual(await setupError({ model: "" }), ["模型未配置", "AI_SETUP"]);
 
   // A request that never answers fails with a retryable timeout instead of hanging the caller.
   ctx.fetch = (url, { signal }) => new Promise((_, reject) => signal.addEventListener("abort", () => reject(signal.reason)));

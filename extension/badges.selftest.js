@@ -4,9 +4,9 @@ const path = require("path");
 const vm = require("vm");
 const assert = require("assert");
 
-// The manifest loads typing.js, tag-core.js and bili-surfaces.js before badges.js in the same content-script world.
-const tagCoreJs = fs.readFileSync(path.join(__dirname, "tag-core.js"), "utf8");
-const badgesJs = fs.readFileSync(path.join(__dirname, "typing.js"), "utf8") + tagCoreJs + fs.readFileSync(path.join(__dirname, "bili-surfaces.js"), "utf8") + fs.readFileSync(path.join(__dirname, "badges.js"), "utf8");
+// The scripts the manifest's badges.js entry injects, in its order, read from it so the test cannot load a different set.
+const badgesEntry = JSON.parse(fs.readFileSync(path.join(__dirname, "manifest.json"), "utf8")).content_scripts.find((c) => c.js.at(-1) === "badges.js").js;
+const badgesJs = badgesEntry.map((f) => fs.readFileSync(path.join(__dirname, f), "utf8")).join("\n");
 const ctx = vm.createContext({ URLSearchParams });
 vm.runInContext(badgesJs, ctx);
 const { bvidFromHref, badgeInfo, mergeDecisions, lineParts } = ctx.BocBadges;
@@ -19,15 +19,13 @@ assert.strictEqual(bvidFromHref("https://www.bilibili.com/video/av170001"), "");
 assert.strictEqual(bvidFromHref("https://space.bilibili.com/2773586"), "");
 assert.strictEqual(bvidFromHref(null), "");
 
-// 观看进度: one copy of the defaults, the parsing and the words, in bili-surfaces.js; triage.html loads it before triage.js.
+// 观看进度: one copy of the defaults, the parsing and the words, in bili-surfaces.js.
 const B = ctx.BocSurfaces;
 assert.deepStrictEqual(plain(B.seenConfig(B.SEEN_DEFAULTS)), { on: false, bar: false, mark: false, threshold: 80, style: "badge" });
 assert.deepStrictEqual(plain(B.seenConfig({ seenShow: "both", seenThreshold: "90", seenStyle: "veil" })), { on: true, bar: true, mark: true, threshold: 90, style: "veil" });
 assert.deepStrictEqual(plain(B.seenConfig({ seenShow: "mark", seenThreshold: 0, seenStyle: "x" })), { on: true, bar: false, mark: true, threshold: 80, style: "badge" });
 assert.deepStrictEqual([B.seenWords(100, false), B.seenWords(85, true), B.seenWords(40, false)], ["✓ 看完了", "✓ 看到 85%", "看到 40%"]);
-const triageHtml = fs.readFileSync(path.join(__dirname, "triage/triage.html"), "utf8");
-assert.ok(triageHtml.indexOf("../bili-surfaces.js") > -1 && triageHtml.indexOf("../bili-surfaces.js") < triageHtml.indexOf("./triage.js"), "triage.html loads bili-surfaces.js before triage.js");
-for (const f of ["badges.js", "triage/triage.js"]) {
+for (const f of ["badges.js", "triage/triage.js", "options.js"]) {
   const src = fs.readFileSync(path.join(__dirname, f), "utf8");
   assert.ok(!src.includes('seenShow: "off"') && !src.includes("✓ 看完了") && !/seenShow === "both"/.test(src), `${f} keeps its own 观看进度 defaults or words`);
 }
@@ -679,7 +677,9 @@ async function plusPage() {
   stopped = 0;
   doc.listeners.click.forEach((f) => f(ev(plusOf(title("c")))));
   assert.strictEqual(stopped, 2, "a stale page's 「+」 click does not fall through to the author link");
-  assert.strictEqual(doc.childNodes.at(-1).shadow.querySelector(".empty")?.textContent, "扩展刚刚更新，请刷新网页");
+  const stale = doc.childNodes.at(-1).shadow.querySelector(".pick");
+  assert.strictEqual(stale.querySelector(".empty")?.textContent, "扩展刚刚更新，请刷新网页");
+  assert.ok(stale.style.top && stale.style.left, "the notice is placed under the 「+」, not left off-screen");
 }
 
 // ---- the live script on other surfaces: the 分拣台's player, a home page with a header popover, a 收藏夹 page ----
@@ -756,6 +756,15 @@ async function surfacePages() {
   const favMarks = await page({ hostname: "space.bilibili.com", pathname: "/9/favlist", search: "?fid=5" }, h("body", {}, h("div", {}, card)), false, { showBiliTriageBadges: true, showBiliVerdicts: true });
   assert.ok(favMarks.reads.some((k) => [].concat(k).includes("triage_snapshot_5")), "the folder's snapshot is read");
   assert.deepStrictEqual(favMarks.doc.querySelectorAll(".mdg-v").map((v) => [v.className, v.textContent]), [["mdg-v mdg-drop", "AI 可清理"]]);
+  // Another folder's snapshot changing (the 分拣台 loading 所有收藏夹) leaves the marks alone; this folder's redraws them.
+  const snapReads = () => favMarks.reads.filter((k) => [].concat(k).includes("triage_snapshot_5")).length;
+  const readsBefore = snapReads();
+  favMarks.listen.forEach((f) => f({ triage_snapshot_6: { newValue: {} } }, "local"));
+  await new Promise((r) => setTimeout(r, 30));
+  assert.deepStrictEqual([favMarks.doc.querySelectorAll(".mdg-v").length, snapReads()], [1, readsBefore], "another folder's snapshot: no redraw");
+  favMarks.listen.forEach((f) => f({ triage_snapshot_5: { newValue: {} } }, "local"));
+  await new Promise((r) => setTimeout(r, 30));
+  assert.strictEqual(snapReads(), readsBefore + 1, "this folder's snapshot: read again");
 
   // The video page's UP name: its own line under the name row, 「+ UP 标签」 always shown.
   const row = h("div", { class: "up-detail-top" }, h("a", { href: "//space.bilibili.com/1/", class: "up-name" }, " 甲 ", h("span", { class: "mask" })), h("a", { href: "//message.bilibili.com/" }, "发消息"));

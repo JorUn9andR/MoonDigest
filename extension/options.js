@@ -138,9 +138,8 @@ function init() {
       closeAllFixedPropertyMenus();
     }
   });
-  [elements.noteFolder, elements.obsidianApiBaseUrl, elements.obsidianApiKey, elements.tags].forEach((input) => {
-    input?.addEventListener("input", () => input.classList.remove("input-error"));
-  });
+  // Typing in any box marked red (by validation or by save-settings' too-long field) clears its mark.
+  document.addEventListener("input", (event) => event.target.classList?.remove("input-error"));
   elements.obsidianApiKey.addEventListener("input", syncObsidianKeyTag);
   // Focuses an open triage tab instead of a second one.
   document.querySelector('a.jump[href$="triage.html"]')?.addEventListener("click", async (event) => {
@@ -347,8 +346,8 @@ function syncSeenRows() {
     fig.querySelector(".seen-tag").textContent = words;
     fig.querySelector("i").style.width = `${pct}%`;
   };
-  cover("full", share, share >= 100 ? "✓ 看完了" : `✓ 看到 ${share}%`);
-  cover("half", half, `看到 ${half}%`);
+  cover("full", share, BocSurfaces.seenWords(share, true));
+  cover("half", half, BocSurfaces.seenWords(half, false));
 }
 
 async function saveSettings() {
@@ -710,9 +709,7 @@ function applyValidationError(validation) {
 }
 
 function clearInputErrors() {
-  [elements.noteFolder, elements.obsidianApiBaseUrl, elements.obsidianApiKey, elements.tags].forEach((input) => {
-    input?.classList.remove("input-error");
-  });
+  document.querySelectorAll(".input-error").forEach((input) => input.classList.remove("input-error"));
   clearFixedPropertyErrors();
   clearNoteSectionErrors();
 }

@@ -922,6 +922,7 @@ function retireUnchosenFolders() {
     if (!S.allFolders.length) return; // 默认收藏夹 always exists; an empty list is never "every folder deleted"
     if (!S.included.length) return; // nothing chosen yet (or all unticked by accident): never empty every folder into 已出分拣范围
     const live = new Set(S.folders.map((f) => String(f.id)));
+    if (S.toviewUnread) live.add(TOVIEW); // missing because its read failed, not deleted: keep it until the next read
     const keys = ((await chrome.storage.local.getKeys?.()) ?? Object.keys((await chrome.storage.local.get(null)) || {})).filter((k) => k.startsWith(KEYS.triageSnapshotPrefix));
     const gone = keys.map((k) => k.slice(KEYS.triageSnapshotPrefix.length)).filter((id) => !live.has(id));
     if (!gone.length) return;
@@ -975,8 +976,11 @@ async function loadFolders() {
     return;
   }
   S.allFolders = r.data.folders || [];
+  S.toviewUnread = Boolean(r.data.toviewUnread);
   S.mid = r.data.mid;
   S.included = (await loadIncluded()).map(String);
+  // Its data stays (retireUnchosenFolders keeps it); say so, amber like any reminder that blocks nothing.
+  if (S.toviewUnread && S.included.includes(TOVIEW)) showBanner("稍后再看这次没读到，点「重试」再读一次", "重试", loadFolders, "toview");
   S.folders = S.allFolders.filter((f) => S.included.includes(String(f.id)));
   await retireUnchosenFolders();
   S.removedCount = Object.keys(await storeGet(K.removed, {})).length;
@@ -2026,11 +2030,12 @@ function recentUnfavs() {
 function recentUnfavHtml() {
   const list = recentUnfavs();
   if (!list.length) return "";
+  const wait = batchWriting() ? `${batchWriting()}还在跑，等它完成` : "";
   const rows = list
     .map(([b, d]) => {
       const title = esc(d.title || b);
       return `<li><span class="recent-title">${title}</span><span class="muted">${esc(fmtTime(d.at))}</span>
-        ${refaving.has(b) ? `<button type="button" aria-busy="true" disabled>重新收藏中…</button>` : `<button type="button" data-refav="${esc(b)}" aria-label="重新收藏 ${title}">重新收藏</button>`}</li>`;
+        ${refaving.has(b) ? `<button type="button" aria-busy="true" disabled>重新收藏中…</button>` : `<button type="button" data-refav="${esc(b)}" aria-label="重新收藏 ${title}"${UI.reasonAttrs(wait)}>重新收藏</button>`}</li>`;
     })
     .join("");
   // One line per batch 取消收藏 of two or more still listed, newest first.
@@ -2040,7 +2045,6 @@ function recentUnfavHtml() {
   const batchRows = batches
     .map(({ batch, n }) => {
       const busy = unfavBatchItems(batch).some((it) => refaving.has(it.bvid));
-      const wait = batchWriting() ? `${batchWriting()}还在跑，等它完成` : "";
       return `<p class="recent-batch"><span>${esc(fmtTime(batch))} 批量取消收藏 ${n} 个</span>${busy ? `<button type="button" aria-busy="true" disabled>重新收藏中…</button>` : `<button type="button" data-refav-batch="${batch}" aria-label="这批 ${n} 个全部重新收藏"${UI.reasonAttrs(wait)}>这批全部重新收藏</button>`}</p>`;
     })
     .join("");
@@ -2048,6 +2052,7 @@ function recentUnfavHtml() {
 }
 
 // The batch write running now (取消收藏, 移动/复制, 重新收藏), by name; only one at a time, as they may touch one folder.
+// A single 重新收藏 (its button or U) also waits for it: it shares S.refavRun and the "refav" wait with the batch one.
 const batchWriting = () => (S.unfavBatch ? "批量取消收藏" : S.transferRun ? "移动/复制" : S.refavRun ? "重新收藏" : "");
 // Closing or reloading the page stops a batch write halfway and loses a notes export: the browser asks first.
 window.addEventListener("beforeunload", (e) => {
@@ -2116,7 +2121,7 @@ async function refavBatch(batch) {
 const refaving = new Set();
 async function refavRecent(bvid) {
   const d = S.decisions[bvid];
-  if (!d?.aid || refaving.has(bvid)) return;
+  if (!d?.aid || refaving.has(bvid) || batchWriting()) return;
   const mediaId = S.mediaId;
   const { error } = await refavMany(String(mediaId), [{ bvid, aid: d.aid }]);
   if (error) return toast(`重新收藏失败：${error}`, true);
@@ -2435,9 +2440,10 @@ function batchUndoAsk(entry) {
 async function undo() {
   const steps = followMode() ? S.modeUndo : S.undo;
   const top = steps.at(-1);
-  if (top?.kind === "unfavMany" && batchWriting()) return toast(`${batchWriting()}还在跑，等它完成再撤销`, true);
+  const refavs = top?.kind === "unfavMany" || (top?.kind === "decision" && top.action === "unfav");
+  if (refavs && batchWriting()) return toast(`${batchWriting()}还在跑，等它完成再撤销`, true);
   const ask = top && batchUndoAsk(top);
-  if (ask && (!(await askConfirm(ask[0], ask[1], ask[2] || "撤销")) || steps.at(-1) !== top || (top.kind === "unfavMany" && batchWriting()))) return;
+  if (ask && (!(await askConfirm(ask[0], ask[1], ask[2] || "撤销")) || steps.at(-1) !== top || (refavs && batchWriting()))) return;
   const entry = steps.pop();
   if (!entry) {
     toast("没有可撤销的操作");
@@ -3270,7 +3276,7 @@ async function retry(bvid) {
   const r = await analyzeOne(bvid, true, judge);
   if (!r.ok) {
     S.analyses[bvid] = { bvid, status: "error", error: r.error };
-    if (THROTTLES[r.code]) toast(`${THROTTLES[r.code][1]}，请稍后再试`, true);
+    if (THROTTLES[r.code]) toast(`${THROTTLES[r.code].label}，请稍后再试`, true);
     else handleAiError(r.error, r.code);
   } else {
     S.analyses[bvid] = { criteria: judge.crit, ...r.data };
@@ -3777,7 +3783,7 @@ async function runWrite(md = false) {
     const r = await send(md ? { type: "triage-build-note", bvid: it.bvid } : { type: "triage-write-note", bvid: it.bvid, overwrite });
     // B站 risk control: wait as 粗看 / 细看 do, then the same video again.
     if (!r.ok && THROTTLES[r.code]) {
-      el.writeProgress.textContent = `${THROTTLES[r.code][1]}，等待后重试：${it.title}`;
+      el.writeProgress.textContent = `${THROTTLES[r.code].label}，等待后重试：${it.title}`;
       await waitOut("write", THROTTLES[r.code], keepGoing);
       i--;
       continue;
@@ -4175,6 +4181,8 @@ function bindEvents() {
     renderTagLimit();
     toast("设置已保存");
     const included = [...el.folderToggles.querySelectorAll("input:checked")].map((x) => x.value);
+    // 稍后再看 had no checkbox (its read failed): its choice stays as it was.
+    if (S.toviewUnread && S.included.includes(TOVIEW)) included.push(TOVIEW);
     const same = included.length === S.included.length && included.every((id) => S.included.includes(id));
     if (S.allFolders.length && !same) {
       await storeSet(K.included, included);

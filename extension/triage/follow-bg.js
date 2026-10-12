@@ -6,9 +6,11 @@
 // - follow-sync-stop {}       停下；再发 follow-sync 从游标接着跑。
 // - follow-feed { offset }    一页视频动态 { items: [{ bvid, aid, title, cover, duration, play, mid, name, face, at }], offset, hasMore }，缓存 3 分钟。
 // - follow-relation { mid, act, gone? }  1 关注 / 2 取关，成功后改好 follow_list、follow_unfollowed、follow_tag_map；gone = 撤销重新关注时放回的取关记录。
+//                             取关记录存当时的分组；重新关注时放回还在的那些 → { groups, groupsError }（没放回不算失败）。
 // - follow-group-move { mids, from, to }  关注分组：from 为空是复制到 to（copyUsers），否则从 from 移到 to（moveUsers）。
 //                             -10 是特别关注，0 是默认分组。成功后改好 follow_list.special / groups。
 //                             整批被拒时逐个再发，→ { skipped: [{ mid, error }] } 是 B站 不收的（如已注销）；全被拒才报错。
+// - follow-forget { mids }    清理：删掉这些人的已取消关注记录（连同记录里的标签），不改 B站。
 // - follow-group-create { name } → { id, name }；follow-group-rename { id, name }；follow-group-delete { id }
 //                             新建、改名、删除 B站 的关注分组，成功后改好 follow_groups（删除时成员的 groups 也去掉它）。
 // - follow-ai-tag { instruction, mids, tags?, maxNewTags?, allowRemove? }
@@ -19,6 +21,8 @@
 //   第一次同步每拉一页就先写进 follow_list（partial: true），界面不用等拉完。
 // 2 feed：视频动态往回翻过 followSlowDays 天 → follow_last（谁最近发过、最近 3 个标题），翻完才写，翻到一半的每页存进 follow_last_wip，界面边翻边读。6 小时内翻过就跳过。
 // 3 arc：动态里没出现的人逐个 arc/search（约 1 秒 1 个）→ follow_content；已有记录且不早于 follow_last.since 的跳过。
+//   一个视频都没有的再查 x/space/upstat 的视频播放量（views）：大于 0 是发过视频、现在全没了（投稿已清空）；查不到就不记 views，下次再查。
+//   投稿已清空的人又有了视频（UP 回归：动态里出现或这次查到）记进 follow_jobs.posted。
 //   follow_jobs.cur 是正在查的人。做完写 follow_jobs.statusAt：更新状态已齐，界面不用等第 4 步。
 // 4 stats：每个关注的人的粉丝数（x/relation/stat）→ follow_stats；7 天内查过的跳过。
 // 所有 GET 共用一个队列（间隔 1–1.5 秒），30 秒没回应算断网；风控（412、-352/-412/-799/-509）整队暂停 90 秒重试，第三次报 THROTTLED。
@@ -70,7 +74,7 @@ function followDiff(cur, fresh, unf, tagMap, live, startedAt, at) {
   const gone = {};
   if (fresh.complete) {
     for (const m of cur.list || []) {
-      if (!inFresh.has(m) && !kept.includes(m) && !unf[m]) gone[m] = { at, tagIds: tagMap[m] || [], source: "bili" };
+      if (!inFresh.has(m) && !kept.includes(m) && !unf[m]) gone[m] = { at, tagIds: tagMap[m] || [], source: "bili", groups: followGroupsOf(cur, m) };
     }
   }
   const inList = new Set(list);
@@ -84,6 +88,9 @@ function followDiff(cur, fresh, unf, tagMap, live, startedAt, at) {
     restore
   };
 }
+
+// 一个人当时所在的分组 id：-10 特别关注在前，再是自己建的；空 = 默认分组。取关记录里存这个，重新关注时放回。
+const followGroupsOf = (fl, m) => [...(fl?.special?.[m] ? [-10] : []), ...(fl?.groups?.[m] || [])];
 
 // 动态里的播放数是文字："2505"、"12.5万"、"1.2亿"。
 function followCount(v) {
@@ -381,7 +388,20 @@ async function followSyncJob(ctx) {
   const since = s.follow_last?.since || 0;
   const have = s.follow_content || {};
   const targets = (s.follow_list?.list || []).filter((m) => !seen[m]);
-  const known = (m) => have[m] && (!have[m].code || FOLLOW_GONE_CODES.has(have[m].code)) && have[m].at >= since;
+  // 投稿已清空的人（没视频、播放量 > 0）又有了视频：动态里看到了，或这次查到了。记进 follow_jobs.posted 给界面的刷新结果，
+  // 旧的 0 个视频记录删掉（动态里有的就不用再查），下次不再报。
+  const wasCleared = (m) => have[m] && !have[m].code && !have[m].count && have[m].views > 0;
+  const posted = (s.follow_list?.list || []).filter((m) => wasCleared(m) && seen[m]);
+  if (posted.length) {
+    await followUpdate(["follow_content"], (st) => {
+      const fc = { ...st.follow_content };
+      for (const m of posted) delete fc[m];
+      return { follow_content: fc };
+    });
+    for (const m of posted) delete have[m];
+    await ctx.progress({ posted });
+  }
+  const known = (m) => have[m] && (FOLLOW_GONE_CODES.has(have[m].code) || (!have[m].code && (have[m].count || have[m].views != null))) && have[m].at >= since;
   let done = targets.filter(known).length;
   let skipped = 0;
   const step = "查投稿：视频投稿里没有的 UP 主";
@@ -401,6 +421,17 @@ async function followSyncJob(ctx) {
         continue;
       }
       rec = { code: e.code, count: 0, tlist: {}, v: [] };
+    }
+    if (!rec.code && !rec.count) {
+      const views = await get(() => followGetData(`${FOLLOW_API}/x/space/upstat?mid=${mid}`)).then((d) => Number(d?.archive?.view), (e) => {
+        if (typeof e.code === "string") throw e;
+        return NaN;
+      });
+      if (Number.isFinite(views)) rec.views = views;
+    }
+    if (wasCleared(mid) && rec.count) {
+      posted.push(mid);
+      await ctx.progress({ posted });
     }
     await followUpdate(["follow_content"], (st) => ({ follow_content: { ...st.follow_content, [mid]: { ...rec, at: followNow() } } }));
     await ctx.progress({ done: ++done });
@@ -475,7 +506,7 @@ async function followStart() {
   const startedAt = cursor ? prev.startedAt : followNow();
   await followPatchJob({
     running: true, error: null, errorCode: null, throttled: false, hold: null, finishedAt: null, slowUntil: Math.ceil(followSlowUntil / 1000),
-    ...(cursor ? {} : { startedAt, phase: "list", step: "", done: 0, total: 0, skipped: 0, cursor: null, changes: null })
+    ...(cursor ? {} : { startedAt, phase: "list", step: "", done: 0, total: 0, skipped: 0, cursor: null, changes: null, posted: [] })
   });
   followOnHold = (hold) => followPatchJob({ hold, slowUntil: Math.ceil(followSlowUntil / 1000) }).catch(() => {});
   // 停下立即生效，退避中也一样：正在等的请求直接丢掉。
@@ -527,6 +558,18 @@ async function followRelation({ mid, act, gone }) {
   if (!/^\d+$/.test(mid) || (act !== 1 && act !== 2)) throw triageError("缺少 mid 或 act 不对");
   await triageBiliPost("/x/relation/modify", { fid: mid, act, re_src: 11 });
   const at = followNow();
+  // 重新关注：取关记录里的分组还在的，放回去（一次 copyUsers）。没放回不算重新关注失败（groupsError 带原因）。
+  let back = [];
+  let groupsError = "";
+  if (act === 1) {
+    const s0 = await chrome.storage.local.get(["follow_unfollowed", "follow_groups"]);
+    const have = new Set([FOLLOW_SPECIAL, ...(s0.follow_groups || []).map((g) => g.id)]);
+    back = (s0.follow_unfollowed?.[mid]?.groups || []).filter((id) => have.has(id));
+    if (back.length) await triageBiliPost("/x/relation/tags/copyUsers", { fids: mid, tagids: back.join(",") }).catch((e) => {
+      groupsError = e.message;
+      back = [];
+    });
+  }
   await followUpdate(["follow_list", "follow_unfollowed", "follow_tag_map", "follow_tags"], (s) => {
     const f = s.follow_list || {};
     const unf = { ...s.follow_unfollowed };
@@ -537,8 +580,8 @@ async function followRelation({ mid, act, gone }) {
     const list = (f.list || []).filter((x) => x !== mid);
     if (act === 2) {
       // 重复取关不覆盖已有记录；标签挪进记录。撤销重新关注时放回原记录。
-      if (gone && typeof gone === "object") unf[mid] = { at: Number(gone.at) || at, tagIds: (Array.isArray(gone.tagIds) ? gone.tagIds : []).map(String), source: gone.source === "bili" ? "bili" : "app" };
-      else if (!unf[mid]) unf[mid] = { at, tagIds: tagMap[mid] || [], source: "app" };
+      if (gone && typeof gone === "object") unf[mid] = { at: Number(gone.at) || at, tagIds: (Array.isArray(gone.tagIds) ? gone.tagIds : []).map(String), source: gone.source === "bili" ? "bili" : "app", ...(Array.isArray(gone.groups) ? { groups: gone.groups.map(Number).filter(Number.isInteger) } : {}) };
+      else if (!unf[mid]) unf[mid] = { at, tagIds: tagMap[mid] || [], source: "app", groups: followGroupsOf(f, mid) };
       delete tagMap[mid];
       delete followTime[mid];
       delete special[mid];
@@ -550,10 +593,13 @@ async function followRelation({ mid, act, gone }) {
       delete unf[mid];
       followTime[mid] = at;
       list.unshift(mid);
+      if (back.includes(FOLLOW_SPECIAL)) special[mid] = 1;
+      const own = back.filter((id) => id > 0);
+      if (own.length) groups[mid] = own;
     }
     return { follow_list: { ...f, list, followTime, special, groups }, follow_unfollowed: unf, follow_tag_map: tagMap };
   });
-  return {};
+  return { groups: back, groupsError };
 }
 
 // ===== 关注分组 =====
@@ -626,6 +672,16 @@ async function followGroupMove({ mids, from, to }) {
     return { follow_list: { ...fl, special, groups } };
   });
   return { skipped };
+}
+
+async function followForget({ mids }) {
+  const list = (Array.isArray(mids) ? mids : []).map(String);
+  await followUpdate(["follow_unfollowed"], (s) => {
+    const unf = { ...s.follow_unfollowed };
+    for (const m of list) delete unf[m];
+    return { follow_unfollowed: unf };
+  });
+  return {};
 }
 
 async function followGroupCreate({ name }) {
@@ -733,6 +789,7 @@ const FOLLOW_HANDLERS = {
   "follow-sync-stop": async () => (await followStop(), {}),
   "follow-feed": (msg) => followFeed(msg),
   "follow-relation": (msg) => followRelation(msg),
+  "follow-forget": (msg) => followForget(msg),
   "follow-group-move": (msg) => followGroupMove(msg),
   "follow-group-create": (msg) => followGroupCreate(msg),
   "follow-group-rename": (msg) => followGroupRename(msg),

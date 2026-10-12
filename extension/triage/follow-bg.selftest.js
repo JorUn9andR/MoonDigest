@@ -82,10 +82,10 @@ const runSync = async () => {
 (async () => {
   // ---------- pure: followings diff ----------
   {
-    const cur = { list: ["1", "2", "9"], followTime: { 1: 10, 2: 10, 9: 10 } };
+    const cur = { list: ["1", "2", "9"], followTime: { 1: 10, 2: 10, 9: 10 }, special: { 9: 1 }, groups: { 9: [7] } };
     const live = new Set(["a"]);
     const d = t.followDiff(cur, { list: ["1", "2"], followTime: { 1: 10, 2: 10 }, complete: true }, {}, { 9: ["a", "x"] }, live, 500, 600);
-    assert.deepStrictEqual(plain(d.gone), { 9: { at: 600, tagIds: ["a", "x"], source: "bili" } }, "vanished account recorded with its tags");
+    assert.deepStrictEqual(plain(d.gone), { 9: { at: 600, tagIds: ["a", "x"], source: "bili", groups: [-10, 7] } }, "vanished account recorded with its tags and groups");
     const partial = t.followDiff(cur, { list: ["1"], followTime: { 1: 10 }, complete: false }, {}, {}, live, 500, 600);
     assert.deepStrictEqual(plain(partial.gone), {}, "a partial fetch never marks anyone gone");
     // 新关注 +N · 取关 −M: only from a complete fetch against a list we had
@@ -176,6 +176,36 @@ const runSync = async () => {
     await runSync();
     assert.ok(!calls.some((c) => c.startsWith("polymer")), "fresh feed skipped");
     assert.deepStrictEqual(calls.filter((c) => c.startsWith("space")), ["space/wbi/arc/search#1", "space/wbi/arc/search#6"]);
+  }
+
+  // ---------- no videos: upstat's 视频播放量 says 投稿已清空 (views > 0) or 没投过稿; not read is asked again ----------
+  {
+    local = { follow_list: { list: ["1", "2", "3"], followTime: { 1: 1, 2: 2, 3: 3 } } };
+    calls = [];
+    routes = {
+      "/x/web-interface/nav": nav,
+      "/x/relation/stat": () => json({ code: 0, data: { follower: 1 } }),
+      "/x/relation/followings": followings([[person(1), person(2), person(3)]], 3),
+      "/x/relation/tags": () => json({ code: 0, data: [] }),
+      "/x/polymer/web-dynamic/v1/feed/all": feed([[]]),
+      "/x/space/wbi/arc/search": () => arcOk(0),
+      "/x/space/upstat": (u) => (u.searchParams.get("mid") === "3" ? json({ code: 500, message: "x" }) : json({ code: 0, data: { archive: { view: u.searchParams.get("mid") === "1" ? 4200 : 0 }, likes: 9 } }))
+    };
+    await runSync();
+    assert.ok(!local.follow_jobs.error, local.follow_jobs.error);
+    assert.deepStrictEqual([local.follow_content[1].views, local.follow_content[2].views, "views" in local.follow_content[3]], [4200, 0, false]);
+    calls = [];
+    local.follow_last.at = now();
+    await runSync();
+    assert.deepStrictEqual(calls.filter((c) => c.startsWith("space")), ["space/wbi/arc/search#3", "space/upstat#3"], "only the one without views is asked again");
+    // 1 (投稿已清空) posts again: the feed shows it, the refresh says so once and drops the old record.
+    routes["/x/polymer/web-dynamic/v1/feed/all"] = feed([[dyn(1, "BVnew", now() - 60)]]);
+    local.follow_last.at = now() - 7 * 3600;
+    await runSync();
+    assert.deepStrictEqual([plain(local.follow_jobs.posted), "1" in local.follow_content], [["1"], false]);
+    local.follow_last.at = now() - 7 * 3600;
+    await runSync();
+    assert.deepStrictEqual(plain(local.follow_jobs.posted), [], "said once");
   }
 
   // ---------- a feed walk cut off midway keeps the last complete one; continue finishes it ----------
@@ -422,6 +452,24 @@ const runSync = async () => {
 
   }
 
+  // ---------- 取关 keeps the groups in the record; 重新关注 puts back the ones that still exist ----------
+  {
+    local = { follow_list: { list: ["1"], followTime: { 1: 1 }, special: { 1: 1 }, groups: { 1: [5, 6] } }, follow_groups: [{ id: 5, name: "五" }, { id: 6, name: "六" }] };
+    posts = [];
+    await t.followRelation({ mid: "1", act: 2 });
+    assert.deepStrictEqual(plain(local.follow_unfollowed[1].groups), [-10, 5, 6]);
+    local.follow_groups = [{ id: 5, name: "五" }]; // 六 deleted since
+    const r = await t.followRelation({ mid: "1", act: 1 });
+    assert.deepStrictEqual(posts.at(-1), ["/x/relation/tags/copyUsers", { fids: "1", tagids: "-10,5", csrf: "csrf" }]);
+    assert.deepStrictEqual([plain(r.groups), local.follow_list.special[1], plain(local.follow_list.groups[1])], [[-10, 5], 1, [5]]);
+    // The groups not put back do not fail the 重新关注.
+    await t.followRelation({ mid: "1", act: 2 });
+    postReply = () => (posts.at(-1)[0].includes("copyUsers") ? json({ code: 22104, message: "分组不存在" }) : json({ code: 0, data: {} }));
+    const r2 = await t.followRelation({ mid: "1", act: 1 });
+    postReply = null;
+    assert.ok(/22104/.test(r2.groupsError) && local.follow_list.list.includes("1") && !local.follow_list.special[1]);
+  }
+
   // ---------- 关注分组: B站 params, follow_list / follow_groups changed only after B站 said yes ----------
   {
     local = {
@@ -482,6 +530,12 @@ const runSync = async () => {
     assert.strictEqual(posts.length, 1);
     postReply = null;
     local = JSON.parse(kept);
+
+    // 清理: the 已取消关注 records go, nothing is sent to B站.
+    local.follow_unfollowed = { 7: { at: 1, tagIds: ["a"], source: "app" }, 8: { at: 2, tagIds: [], source: "bili" } };
+    const sentBefore = posts.length;
+    await t.followForget({ mids: ["7", 9] });
+    assert.deepStrictEqual([Object.keys(local.follow_unfollowed), posts.length], [["8"], sentBefore]);
 
     // 新建 / 改名 / 删除.
     postReply = () => json({ code: 0, data: { tagid: 42 } });

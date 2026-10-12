@@ -39,7 +39,7 @@
   // Selecting (收藏夹 and 关注 UP 主): a click anywhere on the card picks it, cover and UP links included. The video
   // titles play and the controls inside keep their own. Shift picks the run from the last picked card; ⌘ / Ctrl /
   // middle on a link still open B站.
-  const PICK_CONTROLS = "button, input, textarea, select, label, [data-pick], [data-act=open], [data-play]";
+  const PICK_CONTROLS = "button, input, textarea, select, label, [data-pick], [data-act=open], [data-play], [data-space]";
   const cardPickClick = (e) =>
     e.button === 0 && !e.metaKey && !e.ctrlKey && !e.altKey &&
     !e.target.closest(PICK_CONTROLS) && (e.shiftKey || globalThis.getSelection?.()?.isCollapsed !== false);
@@ -396,7 +396,7 @@
     labeledRow(label, `${pre}${chips}${plus ? tagPlusBtn(plus.attrs, plus.label, plus.key) : ""}`);
   // T / Esc forwarded by viewer-frame.js while focus is in the player: only from the viewer's own frame and B站's origin.
   function viewerKeyFrom(e, frameWin) {
-    const ok = frameWin && e.source === frameWin && e.origin === "https://www.bilibili.com" && e.data?.type === "mdg-viewer-key";
+    const ok = frameWin && e.source === frameWin && /^https:\/\/(www|space)\.bilibili\.com$/.test(e.origin) && e.data?.type === "mdg-viewer-key";
     return ok && ["t", "Escape"].includes(e.data.key) ? e.data.key : "";
   }
 

@@ -2773,6 +2773,19 @@ const unfavOnlyOf = (d) => Object.fromEntries(Object.entries(d).filter(([, v]) =
     ctx.window.addEventListener = realWin;
     const fire = (n, type, e) => (L[n][type] || []).forEach((f) => f(e));
 
+    // 全选 sits in listHeader inside stagebar: one click bubbles through both and selects once, not on and off again.
+    {
+      openFake("A", [item(1), item(2)]);
+      const was = { tab: t.S.tab, query: t.S.query };
+      Object.assign(t.S, { tab: "read", query: "" });
+      t.S.selected.clear();
+      const e = { target: { closest: (sel) => (sel === "[data-head]" ? { dataset: { head: "select-all" } } : null) } };
+      for (const n of ["listHeader", "stagebar"]) (L[n]?.click || []).forEach((f) => f(e));
+      assert.deepStrictEqual(plain([...t.S.selected]), ["BV1", "BV2"], "one click on 全选 selects all");
+      t.S.selected.clear();
+      Object.assign(t.S, was);
+    }
+
     // T pressed in the player (viewer-frame.js) opens the picker under the viewer line; only from the viewer's frame.
     {
       openFake("A", [item(1)]);

@@ -789,7 +789,8 @@ const unfavOnlyOf = (d) => Object.fromEntries(Object.entries(d).filter(([, v]) =
   // F7 / F14: the batch settings and 请求间隔 parse with UI.intIn (shared.selftest.js): rounded and capped at max, empty or
   // below min is the default, 0 a value where min is 0.
   {
-    assert.ok(fs.readFileSync(path.join(__dirname, "triage.html"), "utf8").includes('<input id="intervalInput" type="number" min="0" max="600" step="1" />'), "the box has 关注's range");
+    const html = fs.readFileSync(path.join(__dirname, "triage.html"), "utf8");
+    assert.ok(html.includes('<input id="intervalInput" type="number" data-num="interval"') && html.includes('<input id="fwIntervalInput" type="number" data-num="interval"'), "the box has 关注's range");
     t.S.settings.triageFineBatchSize = 2.7;
     assert.strictEqual(t.nextBatch().length, 3, "rounded");
     t.S.settings.triageFineBatchSize = 999;
@@ -1571,7 +1572,8 @@ const unfavOnlyOf = (d) => Object.fromEntries(Object.entries(d).filter(([, v]) =
     const disabledWhy = (label) => new RegExp(`aria-label="${label}"[^>]*disabled title="${hid}"`).test((t.el.listHeader.innerHTML + t.el.favSel.innerHTML));
     t.S.classFilter.read = "drop";
     t.renderListHeader(t.visibleItems());
-    assert.ok(disabledWhy("收藏选中的 0 个到…"), (t.el.listHeader.innerHTML + t.el.favSel.innerHTML));
+    // J14: with the true count, as row 3's.
+    assert.ok(disabledWhy("收藏选中的 1 个到…"), (t.el.listHeader.innerHTML + t.el.favSel.innerHTML));
     // J2: 清理 stays the selection's, with its true count, off with why.
     assert.ok(disabledWhy("清理选中的 1 个") && !t.el.listHeader.innerHTML.includes("清理这"), t.el.listHeader.innerHTML);
     // F12 / F9: 所有收藏夹 has 全选 like a folder (across its folders), and its bar says why as well.
@@ -1587,7 +1589,7 @@ const unfavOnlyOf = (d) => Object.fromEntries(Object.entries(d).filter(([, v]) =
     t.S.selected.add("BV1");
     t.renderListHeader(t.visibleItems());
     assert.ok((t.el.listHeader.innerHTML + t.el.favSel.innerHTML).includes('data-head="select-all" aria-checked="false"') && (t.el.listHeader.innerHTML + t.el.favSel.innerHTML).includes("全选 2 个"), "所有收藏夹 has 全选");
-    for (const label of ["保留选中的 0 个", "取消收藏选中的 0 个"]) assert.ok(disabledWhy(label), label);
+    for (const label of ["保留选中的 1 个", "取消收藏选中的 1 个"]) assert.ok(disabledWhy(label), label);
     vm.runInContext("UI.toggleAll(visibleItems().map((it) => it.bvid), S.selected)", ctx);
     assert.deepStrictEqual([...t.S.selected].sort(), ["BV1", "BV2", "BV3"], "全选 adds what is listed, keeps the hidden one");
     t.S.selected.clear();

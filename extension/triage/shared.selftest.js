@@ -20,76 +20,79 @@ const plain = (v) => JSON.parse(JSON.stringify(v));
 const XSS = ["<img src=x onerror=alert(1)>", `"'><script>alert(1)</script>`];
 const assertInert = (html, where) => assert.ok(!/<img src=x|<script|"'>/i.test(html) && /&lt;|&#60;/.test(html), `${where}: ${html}`);
 
-// Headroom: reading down past the header folds it; 200px back up, the top, or focus in the header unfolds it.
-{
-  const step = (s, top, full = 200) => plain(UI.headroomStep(s, { top, full }));
-  let s = { collapsed: false, last: 0 };
-  s = step(s, 150);
-  assert.deepStrictEqual(s, { collapsed: false, last: 150 }, "within the header's height: stays full");
-  s = step(s, 260);
-  assert.deepStrictEqual(s, { collapsed: true, last: 260 }, "forward past the header: folds");
-  assert.deepStrictEqual(step(s, 253), s, "a small step back stays folded");
-  assert.deepStrictEqual(step({ collapsed: true, last: 5000 }, 4801), { collapsed: true, last: 5000 }, "so does 199px back");
-  assert.deepStrictEqual(step({ collapsed: true, last: 5000 }, 4800), { collapsed: false, last: 4800 }, "200px back unfolds");
-  let back = { collapsed: true, last: 5000 };
-  for (const top of [4900, 4950, 4850]) back = step(back, top);
-  assert.deepStrictEqual(back, { collapsed: true, last: 5000 }, "counted from the deepest point, not from the last turn");
-  assert.deepStrictEqual(step(back, 4800), { collapsed: false, last: 4800 });
-  back = step(step({ collapsed: true, last: 5000 }, 4900), 5200);
-  assert.deepStrictEqual(step(back, 5050), { collapsed: true, last: 5200 }, "reading further down moves the deepest point");
-  let slow = s;
-  for (const top of [263, 266, 269]) slow = step(slow, top);
-  assert.deepStrictEqual(slow, { collapsed: true, last: 269 }, "folded, last follows the deepest point");
-  slow = { collapsed: false, last: 300 };
-  for (const top of [303, 306, 309]) slow = step(slow, top);
-  assert.deepStrictEqual(slow, { collapsed: true, last: 309 }, "slow forward steps fold too once they reach 8px");
-  assert.deepStrictEqual(step({ collapsed: true, last: 5 }, 0), { collapsed: false, last: 0 }, "the top is always full, even by a small step");
-  assert.deepStrictEqual(plain(UI.headroomStep({ collapsed: true, last: 900 }, { focus: true })), { collapsed: false, last: 900 }, "focus in the header unfolds");
-  assert.deepStrictEqual(step({ collapsed: false, last: 900 }, 1000), { collapsed: true, last: 1000 }, "after a focus, the next read down folds again");
-}
-
-// headroom(main) on a fake page: rows that grow while folded are measured again on unfolding (--head-h, the list's
-// clip); the slim bar's ▾ unfolds through focus alone (Chrome focuses a clicked button), with no click handler of its own.
+// The header fold on a fake page: only its toggle folds and unfolds (no scroll or focus listener), each mode keeps its
+// own state in storage and gets it back on a reload; rows that grow while folded are measured again on unfolding.
 {
   const on = (o) => ((o.L = {}), (o.addEventListener = (t, f) => (o.L[t] ||= []).push(f)), o);
-  const elem = () => on({ prepend() {}, setAttribute() {}, classList: { contains: () => false } });
   const made = [];
+  const body = new Set();
+  let stored = {};
   let measureAll;
   Object.assign(ctx, {
     ResizeObserver: class { constructor(f) { measureAll = f; } observe() {} },
     MutationObserver: class { observe() {} },
-    document: { createElement: () => (made.push(elem()), made.at(-1)) }
+    document: { body: { classList: { contains: (c) => body.has(c) } }, createElement: () => (made.push(on({})), made.at(-1)) },
+    chrome: { storage: { local: {
+      get: () => ({ then: (f) => f(JSON.parse(JSON.stringify(stored))) }),
+      set: (o) => ((stored = { ...stored, ...JSON.parse(JSON.stringify(o)) }), { catch() {} })
+    } } }
   });
-  const cls = ["folder-head", "tabrow", "stagebar", "tagbar"];
-  let y = 0;
-  const rows = cls.map((c) => {
-    const r = on({ offsetTop: y, offsetHeight: 50, offsetParent: {}, classList: { contains: (x) => x === c }, querySelector: () => null, prepend() {} });
-    y += 50;
-    r.closest = () => r;
-    return r;
-  });
-  rows[0].nextElementSibling = rows[1];
-  const list = on({ scrollTop: 0, offsetParent: {}, matches: () => true });
-  const vars = {};
-  const folded = new Set();
-  const main = on({
-    classList: { toggle: (c, b) => (b ? folded.add(c) : folded.delete(c)) },
-    style: { setProperty: (k, v) => (vars[k] = v) },
-    querySelectorAll: (sel) => (sel.includes(".fw-list") ? [list] : rows)
-  });
-  UI.headroom(main);
+  const page = () => {
+    let y = 0;
+    const rows = ["folder-head", "tabrow", "stagebar", "tagbar"].map((c) => {
+      const r = { offsetTop: y, offsetHeight: 50, offsetParent: {}, classList: { contains: (x) => x === c }, querySelector: () => null, prepend() {} };
+      y += 50;
+      return r;
+    });
+    rows[0].nextElementSibling = rows[1];
+    const vars = {};
+    const cls = new Set();
+    const main = on({
+      classList: { toggle: (c, b) => (b ? cls.add(c) : cls.delete(c)) },
+      style: { setProperty: (k, v) => (vars[k] = v) },
+      querySelectorAll: () => rows
+    });
+    made.length = 0;
+    UI.headFold(main);
+    const toggle = made.find((b) => b.className === "act-btn head-toggle");
+    const scroll = (top) => main.L.scroll[0]({ target: { scrollTop: top, matches: (sel) => sel === ".list, .fw-list" } });
+    return { rows, vars, folded: () => cls.has("head-folded"), shadow: () => cls.has("head-scrolled"), scroll, toggle, click: () => toggle.L.click[0]() };
+  };
+  const p = page();
+  assert.deepStrictEqual([p.folded(), p.toggle.ariaLabel, p.toggle.title, p.vars["--head-h"]], [false, "收起头部", "收起头部", "200px"]);
+  assert.ok(!p.toggle.L.click[1], "one click handler");
+  p.click();
+  assert.deepStrictEqual([p.folded(), p.toggle.ariaLabel, plain(stored.triage_head_folded)], [true, "展开头部", { fav: true }], "the toggle folds and remembers it for 收藏夹");
+  p.rows[3].offsetHeight = 90; // the tag row wraps to two lines while folded
   measureAll();
-  assert.strictEqual(vars["--head-h"], "200px");
-  list.scrollTop = 900;
-  main.L.scroll[0]({ target: list });
-  assert.ok(folded.has("head-folded"), "reading down folds");
-  rows[3].offsetHeight = 90; // the tag row wraps to two lines while folded
+  assert.deepStrictEqual([p.folded(), p.vars["--head-h"]], [true, "200px"], "folded: the full height is kept, and a re-measure does not unfold");
+  p.click();
+  assert.deepStrictEqual([p.folded(), p.vars["--head-h"], p.toggle.ariaLabel], [false, "240px", "收起头部"], "unfolding measures the rows again");
+  p.click();
+  body.add("follow-mode");
   measureAll();
-  assert.strictEqual(vars["--head-h"], "200px", "folded: the full height is kept");
-  const open = made.find((b) => b.className === "act-btn slim-open");
-  assert.ok(open && !open.L.click, "▾ has no click handler: focus unfolds it");
-  main.L.focusin[0]({ target: { closest: () => rows[1] } });
-  assert.deepStrictEqual([folded.has("head-folded"), vars["--head-h"]], [false, "240px"], "unfolding measures the rows again");
+  assert.ok(!p.folded(), "关注 has its own state: unfolded");
+  p.click();
+  assert.deepStrictEqual(plain(stored.triage_head_folded), { fav: true, follow: true });
+  body.delete("follow-mode");
+  stored.triage_head_folded = { fav: false, follow: true };
+  const q = page();
+  assert.ok(!q.folded(), "a reload in 收藏夹 gets 收藏夹's state back");
+  body.add("follow-mode");
+  measureAll();
+  assert.ok(q.folded(), "and 关注's");
+  body.delete("follow-mode");
+  // Scrolling the list only shows the shadow under the header; it never folds or unfolds.
+  measureAll();
+  q.scroll(300);
+  assert.deepStrictEqual([q.shadow(), q.folded()], [true, false], "scrolled: shadow, still unfolded");
+  q.click();
+  q.scroll(0);
+  assert.deepStrictEqual([q.shadow(), q.folded()], [false, true], "back at the top: no shadow, still folded");
+  // Nothing else folds or unfolds it: no focus listener, and no other file touches the class.
+  const src = fs.readFileSync(path.join(__dirname, "shared.js"), "utf8");
+  assert.ok(!/"focusin"|headroom/i.test(src), "shared.js does not unfold on focus");
+  for (const f of ["triage.js", "follow.js"]) assert.ok(!fs.readFileSync(path.join(__dirname, f), "utf8").includes("head-folded"), `${f} sets the fold itself`);
 }
 
 // 「今天 / 昨天 / 10月5日 HH:MM 刷新过」, by calendar day, not by 24 hours.
@@ -415,7 +418,7 @@ for (const [file, fns] of [["triage.js", ["mergeAiBatch", "aiChanges"]], ["follo
   assert.ok(bar.startsWith('<div class="selbar" role="toolbar" aria-label="选中的视频"><strong class="sel-count">已选中 2 个</strong><span class="muted">另有 1 个被筛选隐藏</span><button type="button" class="quiet" data-x="clear" aria-label="清空选中">清空选中</button>') && bar.endsWith('<span class="sel-actions"><b>A</b></span></div>'), bar);
   assert.ok(!UI.selbar({ label: "x", n: 1, hidden: 0, clearAttrs: "", acts: () => "" }).includes("隐藏"));
   // Filters hide the whole selection: the bar keeps its buttons and tells each why it is off, the same in both modes.
-  assert.ok(UI.selbar({ label: "x", n: 0, hidden: 2, clearAttrs: "", acts: (none) => UI.actBtn('data-x="a"', "保留选中的 0 个", { reason: none }) }).includes('aria-label="保留选中的 0 个" disabled title="选中的都被筛选隐藏了"'));
+  assert.ok(UI.selbar({ label: "x", n: 0, hidden: 2, clearAttrs: "", acts: (none) => UI.actBtn('data-x="a"', "保留选中的 2 个", { reason: none }) }).includes('aria-label="保留选中的 2 个" disabled title="选中的都被筛选隐藏了"'));
   both("UI.selbar({", "draws its selection bar with selbar");
   neither(/class="selbar"|已选中 \$\{|选中的都被筛选隐藏了/, "draws its own selection bar or its hidden-all reason");
   // One button builder for row 3 and the bar; one 清理 button.
@@ -445,7 +448,13 @@ for (const [file, fns] of [["triage.js", ["mergeAiBatch", "aiChanges"]], ["follo
   for (const f of ["triage.js", "follow.js", "triage-bg.js", "follow-bg.js", "../background.js"]) {
     const src = fs.readFileSync(path.join(__dirname, f), "utf8");
     const bare = /intSetting|intervalSetting|Math\.floor\(Number\(|Number\((el\.\w+|\$\("\w+"\))\.value\)|Number\((s|days|merged)\.\w+\)|parseFloat\(merged\./;
-    assert.ok(/\.intIn\b/.test(src) && !bare.test(src), `${f}: parses its whole-number settings with intIn`);
+    assert.ok(/\.(intIn|numSetting|normalizeSeenThreshold)\b/.test(src) && !bare.test(src), `${f}: parses its whole-number settings with intIn`);
+  }
+  // J15: the dialogs' settings take range and default from NUM_SETTINGS alone: no reader writes them again (triageAiCommand's
+  // maxNewTags, 0 when not passed, is the request's, not the setting's).
+  for (const f of ["triage.js", "follow.js", "triage-bg.js", "follow-bg.js"]) {
+    const src = fs.readFileSync(path.join(__dirname, f), "utf8");
+    assert.ok(!/intIn\([^)]*, ((600|100|50|1000|3650|3651), [1-9]\d*|32000, \d+)\)|(IntervalSec|BatchSize|TagLimit|NewTagMax|MaxTokens|Days): \d|\? (90|365) :/.test(src), `${f} writes a setting's range or default itself`);
   }
 
   // 「✦ AI 刚打的」: one chip, its × and the same tooltip (with the mode's unit); gone at 0 unless it is on.
@@ -509,10 +518,58 @@ for (const [file, fns] of [["triage.js", ["mergeAiBatch", "aiChanges"]], ["follo
   }
   for (const f of ["triage.html", "triage.js", "follow.js"]) assert.ok(!fs.readFileSync(path.join(__dirname, f), "utf8").includes("AI 打标签每批数量"), `${f} names the batch row itself`);
   assert.ok(!/<dialog/.test(fs.readFileSync(path.join(__dirname, "follow.js"), "utf8")), "follow.js builds no dialog markup");
-  const root = { querySelectorAll: () => [row] };
+  const root = { querySelectorAll: (sel) => (sel.includes("data-num") ? [] : [row]) };
   const row = { dataset: { setRow: "aiBatch" }, querySelector: () => ({ id: "x" }), insertAdjacentHTML(_, h) { this.html = h; } };
   UI.fillSetRows(root);
   assert.ok(row.html.includes(">AI 打标签每批数量</label>") && row.html.includes("1–100 个一批。"), row.html);
+  // J15: each number box gets its range and default from NUM_SETTINGS: 「默认 N」, 「自动」 where the default is 0.
+  const box = (num) => ({ dataset: { num } });
+  const boxes = [box("aiBatch"), box("maxTokens"), box("newTagMax")];
+  UI.fillSetRows({ querySelectorAll: (sel) => (sel === "input[data-num]" ? boxes : []) });
+  assert.deepStrictEqual(boxes.map((b) => [b.min, b.max, b.placeholder]), [[1, 100, "默认 30"], [200, 32000, "自动"], [0, 50, "默认 5"]]);
+  assert.deepStrictEqual(["", "x", 0, 999].map((v) => UI.numSetting("aiBatch", v)), [30, 30, 30, 100], "numSetting reads the same table");
+  const numbers = [...html.matchAll(/<input [^>]*type="number"[^>]*>/g)].map((m) => m[0]);
+  assert.strictEqual(numbers.length, 13);
+  for (const n of numbers) assert.ok(/data-num="(\w+)"/.test(n) && UI.NUM_SETTINGS[n.match(/data-num="(\w+)"/)[1]] && !/ (min|max|placeholder)=/.test(n), `${n}: range and default come from NUM_SETTINGS`);
+  // Hints write a setting's numbers through [data-num-min|max|default] spans that fillSetRows fills from the same table;
+  // no page text (tags stripped, so filled spans are empty) or SET_ROWS hint spells a range, 默认 or 最多 of the table.
+  const spans = [{ dataset: { numMin: "tagLimit" } }, { dataset: { numMax: "coarseBatch" } }, { dataset: { numDefault: "fineBatch" } }];
+  UI.fillSetRows({ querySelectorAll: (sel) => (sel.includes("data-num-max") ? spans : []) });
+  assert.deepStrictEqual(spans.map((n) => n.textContent), [1, 1000, 10]);
+  for (const m of html.matchAll(/data-num-(?:min|max|default)="(\w+)"/g)) assert.ok(UI.NUM_SETTINGS[m[1]], m[0]);
+  assert.ok(/data-num-max="coarseBatch"/.test(html) && /data-num-default="fineBatch"/.test(html), "the batch hints read the table");
+  assert.ok(!/<span data-(tag-limit|ai-new-tag-max)>[^<]/.test(html), "the help dialog's caps are filled, not written");
+  // The settings page's two batch hints use the same spans, and every page with spans runs a script that fills them.
+  const optionsHtml = fs.readFileSync(path.join(__dirname, "../options.html"), "utf8");
+  for (const s of ['data-num-default="coarseBatch"', 'data-num-max="coarseBatch"', 'data-num-default="fineBatch"', 'data-num-max="fineBatch"']) assert.ok(optionsHtml.includes(s), `options.html: ${s}`);
+  for (const [page, text] of [["triage.html", html], ["../options.html", optionsHtml]]) {
+    const own = [...text.matchAll(/<script[^>]*src="([^"]+)"/g)].map((m) => path.join(path.dirname(path.join(__dirname, page)), m[1])).filter((f) => !f.endsWith("shared.js"));
+    assert.ok(own.some((f) => /\b(fillNumHints|fillSetRows)\(document\)/.test(fs.readFileSync(f, "utf8"))), `${page}: no script fills the data-num spans`);
+  }
+  const table = Object.values(UI.NUM_SETTINGS);
+  const setRows = fs.readFileSync(path.join(__dirname, "shared.js"), "utf8").match(/const SET_ROWS = \{[\s\S]*?\n  \};/)[0];
+  const pages = ["triage.html", "../options.html", "../popup.html", "../sidepanel.html", "../history/history.html"];
+  for (const [where, text] of [...pages.map((p) => [p, fs.readFileSync(path.join(__dirname, p), "utf8").replace(/<[^>]*>/g, "")]), ["SET_ROWS", setRows]]) {
+    for (const [hit, lo, hi] of text.matchAll(/(\d+)\s*–\s*(\d+)/g)) assert.ok(!table.some(([min, max]) => +lo === min && +hi === max), `${where}: ${hit} repeats a NUM_SETTINGS range`);
+    for (const [hit, n] of text.matchAll(/默认 ?(\d+)/g)) assert.ok(!table.some(([, , def]) => +n === def), `${where}: ${hit} repeats a NUM_SETTINGS default`);
+    for (const [hit, n] of text.matchAll(/最多 ?(\d+)/g)) assert.ok(!table.some(([, max]) => +n === max), `${where}: ${hit} repeats a NUM_SETTINGS max`);
+  }
+  // Titles per 粗看 request: TITLES_PER_REQUEST in shared.js alone; hints show it through [data-titles-per-request].
+  const titleSpans = [{}, {}];
+  UI.fillNumHints({ querySelectorAll: (sel) => (sel === "[data-titles-per-request]" ? titleSpans : []) });
+  assert.deepStrictEqual(titleSpans.map((n) => n.textContent), [UI.TITLES_PER_REQUEST, UI.TITLES_PER_REQUEST]);
+  assert.ok(/一次请求带 <span data-titles-per-request><\/span> 个标题/.test(optionsHtml), "options.html's 粗看 hint reads TITLES_PER_REQUEST");
+  for (const p of pages) assert.ok(!/\d+ ?个标题/.test(fs.readFileSync(path.join(__dirname, p), "utf8").replace(/<[^>]*>/g, "")), `${p} writes the titles per request itself`);
+  for (const f of ["triage.js", "triage-bg.js", "follow.js", "../options.js", "../background.js"]) assert.ok(!/TITLES_PER_REQUEST\s*=/.test(fs.readFileSync(path.join(__dirname, f), "utf8")), `${f} sets the titles per request itself`);
+  // 看到多少算看完了: range and default only in settings.js's SEEN_THRESHOLD; every reader (background, bili-surfaces.js,
+  // options) parses with normalizeSeenThreshold, and the settings page's box gets min, max and 「默认 N」 from code.
+  const seenReaders = ["../background.js", "../bili-surfaces.js", "../options.js", "../options.html", "../badges.js", "triage.js", "triage.html", "triage-bg.js"];
+  for (const f of seenReaders) {
+    const src = fs.readFileSync(path.join(__dirname, f), "utf8");
+    assert.ok(!/seenThreshold\b[^\n]*\b(80|100)\b|\b1, 100\b|\|\| 80\b/.test(src), `${f} writes 看到多少算看完了's range or default itself`);
+  }
+  assert.ok(!/id="seenThreshold"[^>]* (min|max|placeholder)=/.test(optionsHtml), "options.html's 看到多少算看完了 box takes its range from code");
+  for (const f of ["../background.js", "../bili-surfaces.js", "../options.js"]) assert.ok(/MdgSettings\.normalizeSeenThreshold\(/.test(fs.readFileSync(path.join(__dirname, f), "utf8")), `${f} parses 看到多少算看完了 with normalizeSeenThreshold`);
 }
 
 // A number field above max becomes max; below min (or negative) it is emptied, which means the default.

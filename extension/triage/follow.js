@@ -281,8 +281,8 @@ function restoreTags(map, before, live, followed) {
 
 // 关注's own AI 打标签 settings (chrome.storage.sync follow_ai_settings), clamped like the 分拣设置 fields.
 function normAi(s = {}) {
-  const int = UI.intIn;
-  return { batchSize: int(s.batchSize, 1, 100, 30), intervalSec: int(s.intervalSec, 0, 600, 8), newTagMax: int(s.newTagMax, 0, 50, 5), allowRemove: s.allowRemove === true };
+  const num = UI.numSetting;
+  return { batchSize: num("aiBatch", s.batchSize), intervalSec: num("interval", s.intervalSec), newTagMax: num("newTagMax", s.newTagMax), allowRemove: s.allowRemove === true };
 }
 // The first use copies the 收藏夹 values (triage-settings-get, or the defaults); seed is what to store then. After that the
 // two are independent: a stored value always wins.
@@ -301,15 +301,15 @@ function aiRequests(mids, cfg, instruction, tags, allowRemove) {
 }
 // Why the days cannot be saved, or "" (empty boxes fall back to the defaults).
 function settingsProblem(slow, dead) {
-  const s = String(slow).trim() === "" ? 90 : Number(slow);
-  const d = String(dead).trim() === "" ? 365 : Number(dead);
+  const s = String(slow).trim() === "" ? UI.numSetting("slowDays") : Number(slow);
+  const d = String(dead).trim() === "" ? UI.numSetting("deadDays") : Number(dead);
   if (!Number.isFinite(s) || !Number.isFinite(d)) return "天数要填数字";
   return d > s ? "" : "断更天数要比慢更大";
 }
-// 慢更 7–3650 days, 断更 at least a day more.
+// 断更 is at least a day more than 慢更.
 function normDays(slow, dead) {
-  const followSlowDays = UI.intIn(slow, 7, 3650, 90);
-  return { followSlowDays, followDeadDays: Math.max(followSlowDays + 1, UI.intIn(dead, 8, 3651, 365)) };
+  const followSlowDays = UI.numSetting("slowDays", slow);
+  return { followSlowDays, followDeadDays: Math.max(followSlowDays + 1, UI.numSetting("deadDays", dead)) };
 }
 
 // A 刷新 finished between two follow_jobs: the 视频投稿 already loaded is older than what it read.
@@ -356,7 +356,7 @@ const nowSec = () => Date.now() / 1000;
 let D = { tags: [], map: {}, gone: {}, people: {}, content: {}, jobs: {}, list: null, last: null, recent: null };
 let rows = new Map();
 let shown = [];
-const cfg = { slowDays: 90, deadDays: 365 };
+const cfg = { slowDays: UI.numSetting("slowDays"), deadDays: UI.numSetting("deadDays") };
 const F = {
   mode: "fav",
   tab: "ups",
@@ -411,8 +411,8 @@ main.innerHTML = `
   <div class="tagbar fw-tagbar"><span id="fwTagRow" class="tagfilter"></span><span id="fwTools" class="fw-tools"><span id="fwAiSlot"></span></span></div>
   <div id="fwList" class="fw-list" aria-label="UP 主"></div>
   <div id="fwSel"></div>`;
-// Both modes' rows exist from here on (收藏夹's are in triage.html), so the shared fold-on-scroll starts here.
-UI.headroom($("main"));
+// Both modes' rows exist from here on (收藏夹's are in triage.html), so the shared header fold starts here.
+UI.headFold($("main"));
 const SYNC = { pill: $("fwSyncViewBtn"), notice: $("fwSyncNotice"), text: $("fwSyncText"), detail: $("fwSyncDetail"), close: $("fwSyncCloseBtn") };
 UI.bindSync(SYNC);
 const E = { sort: $("fwSort"), title: $("fwTitle"), tools: $("fwTools"), meta: $("fwMeta"), tabs: $("fwTabs"), bar: $("fwBar"), barR: $("fwBarR"), tagRow: $("fwTagRow"), list: $("fwList"), sel: $("fwSel"), q: $("fwQ"), qCount: $("fwQCount") };
@@ -836,13 +836,16 @@ function renderSel() {
   const btn = (act, label, reason, cls = "") => UI.actBtn(`data-fw="${act}"`, label, { reason, cls });
   // 移动 leaves the sidebar's group, so 全部 has none to leave.
   // 已出分拣范围: 重新关注 the unfollowed, 取消关注 the ones still followed (清理 is in row 3, as 收藏夹's).
-  const gone = selShown().filter((m) => rows.get(m).gone).length;
+  // Filters hiding the whole selection: the buttons count all of it, off (none).
+  const pool = n ? selShown() : [...F.sel];
+  const k = pool.length;
+  const gone = pool.filter((m) => rows.get(m)?.gone).length;
   const acts = (none) => F.side === "out"
-    ? btn("refollow", `重新关注选中的 ${gone} 个`, busy || none || (!gone && "选中的都还关注着")) + btn("unfollow", `取消关注选中的 ${n - gone} 个`, busy || none || (n === gone && "选中的都已取消关注"), "danger")
+    ? btn("refollow", `重新关注选中的 ${gone} 个`, busy || none || (!gone && "选中的都还关注着")) + btn("unfollow", `取消关注选中的 ${k - gone} 个`, busy || none || (k === gone && "选中的都已取消关注"), "danger")
     : btn("pick-sel", "标签…", none) +
-      btn("move-sel", `移动选中的 ${n} 个到分组…`, busy || none || (groupId(F.side) == null && "先在分组列表里选一个分组：「全部」里不知道从哪个分组移走")) +
-      btn("copy-sel", `复制选中的 ${n} 个到分组…`, busy || none) +
-      btn("unfollow", `取消关注选中的 ${n} 个`, busy || none, "danger");
+      btn("move-sel", `移动选中的 ${k} 个到分组…`, busy || none || (groupId(F.side) == null && "先在分组列表里选一个分组：「全部」里不知道从哪个分组移走")) +
+      btn("copy-sel", `复制选中的 ${k} 个到分组…`, busy || none) +
+      btn("unfollow", `取消关注选中的 ${k} 个`, busy || none, "danger");
   E.sel.innerHTML = UI.selbar({ label: "选中的 UP 主", n, hidden, clearAttrs: 'data-fw="select-none"', acts });
 }
 
@@ -1889,7 +1892,7 @@ new MutationObserver(() => {
 
 const [{ [VIEW_KEY]: view }, days] = await Promise.all([
   chrome.storage.local.get(VIEW_KEY),
-  chrome.storage.sync.get({ followSlowDays: 90, followDeadDays: 365 })
+  chrome.storage.sync.get({ followSlowDays: null, followDeadDays: null })
 ]);
 ({ followSlowDays: cfg.slowDays, followDeadDays: cfg.deadDays } = normDays(days.followSlowDays, days.followDeadDays));
 if (view?.tab === "feed") F.tab = "feed";

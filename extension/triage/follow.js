@@ -281,7 +281,7 @@ function restoreTags(map, before, live, followed) {
 
 // 关注's own AI 打标签 settings (chrome.storage.sync follow_ai_settings), clamped like the 分拣设置 fields.
 function normAi(s = {}) {
-  const int = (v, lo, hi, d) => (Number.isFinite(Number(v)) && v !== "" && v != null ? Math.min(hi, Math.max(lo, Math.round(Number(v)))) : d);
+  const int = UI.intIn;
   return { batchSize: int(s.batchSize, 1, 100, 30), intervalSec: int(s.intervalSec, 0, 600, 8), newTagMax: int(s.newTagMax, 0, 50, 5), allowRemove: s.allowRemove === true };
 }
 // The first use copies the 收藏夹 values (triage-settings-get, or the defaults); seed is what to store then. After that the
@@ -731,12 +731,15 @@ function renderUps() {
 // 清理, as 收藏夹's: it only forgets (B站 is untouched), so it takes the 已取消关注 among the selected listed ones, else among
 // all listed. The ones still followed are left out: they would come back with the next 刷新, so 取消关注 comes first.
 const cleanable = (mids) => mids.filter((m) => rows.get(m)?.gone);
-function cleanBtn(list) {
+// What 清理 takes from list: { picked: whether it is the selection, mids }.
+function cleanTargets(list = shown) {
   const sel = list.filter((m) => F.sel.has(m));
-  const n = cleanable(sel.length ? sel : list).length;
-  const label = sel.length ? `清理选中的 ${n} 个` : `清理这 ${n} 个`;
-  const why = W.busy() ? busyWhy() : !list.length ? "这里没有列出 UP 主" : !n ? "还关注着的先取消关注，再清理" : "";
-  return `<button type="button" class="danger" data-fw="clean" aria-label="${esc(label)}"${UI.reasonAttrs(why)}>${esc(label)}</button>`;
+  return { picked: sel.length > 0, mids: cleanable(sel.length ? sel : list) };
+}
+function cleanBtn(list) {
+  const { picked, mids } = cleanTargets(list);
+  const why = busyWhy() || (!list.length ? "这里没有列出 UP 主" : !mids.length ? "还关注着的先取消关注，再清理" : "");
+  return UI.cleanBtn('data-fw="clean"', picked, mids.length, why);
 }
 
 function emptyHtml() {
@@ -793,11 +796,14 @@ function upCard(mid) {
   const titles = u.titles.length
     ? `<ul class="fw-titles">${u.titles.map((v) => `<li>${v.bvid ? `<a class="fw-title" href="${esc(video(v.bvid))}" data-play="${esc(v.bvid)}" title="在右侧播放">${esc(v.t)}</a>` : `<span class="fw-title">${esc(v.t)}</span>`}<span class="meta">${UI.agoHtml(v.c, now)}</span></li>`).join("")}</ul>`
     : "";
+  // While a B站 batch runs, the buttons that write B站 (and 清理, which drops the records those batches write) are
+  // disabled with why; the handler's guard is left for other paths.
+  const busy = UI.reasonAttrs(busyWhy());
   const right = u.gone
-    ? `<button type="button" data-refollow="${esc(mid)}" aria-label="重新关注 ${esc(u.name)}">重新关注</button><button type="button" class="danger" data-clean="${esc(mid)}" aria-label="清理 ${esc(u.name)}">清理</button>`
+    ? `<button type="button" data-refollow="${esc(mid)}" aria-label="重新关注 ${esc(u.name)}"${busy}>重新关注</button><button type="button" class="danger" data-clean="${esc(mid)}" aria-label="清理 ${esc(u.name)}"${busy}>清理</button>`
     : kind
-    ? `<button type="button" class="danger" data-unfollow="${esc(mid)}" aria-label="取消关注 ${esc(u.name)}">取消关注</button>`
-    : `<button type="button" class="star${u.special ? " on" : ""}" data-star="${esc(mid)}" aria-pressed="${u.special}" title="${u.special ? "取消特别关注" : "设为特别关注"}（改 B站）" aria-label="${u.special ? "取消特别关注" : "设为特别关注"} ${esc(u.name)}">${u.special ? "★" : "☆"}</button>`;
+    ? `<button type="button" class="danger" data-unfollow="${esc(mid)}" aria-label="取消关注 ${esc(u.name)}"${busy}>取消关注</button>`
+    : `<button type="button" class="star${u.special ? " on" : ""}" data-star="${esc(mid)}" aria-pressed="${u.special}" aria-label="${u.special ? "取消特别关注" : "设为特别关注"} ${esc(u.name)}"${UI.reasonAttrs(busyWhy(), `${u.special ? "取消特别关注" : "设为特别关注"}（改 B站）`)}>${u.special ? "★" : "☆"}</button>`;
   const playing = F.viewing && (F.viewing === upView(mid) || u.titles.some((v) => v.bvid === F.viewing));
   return `<article class="card fw-up${sel ? " selected" : ""}${playing ? " playing" : ""}${F.cur === mid ? " focused" : ""}" data-mid="${esc(mid)}" aria-label="${esc(u.name)}">
     <a class="fw-avatar" href="${space(mid)}" target="_blank" rel="noopener" tabindex="-1" aria-hidden="true">${u.face ? `<img src="${esc(img(u.face, "96w_96h_1c"))}" alt="" loading="lazy" referrerpolicy="no-referrer">` : ""}</a>
@@ -818,7 +824,7 @@ function selShown() {
   return shown.filter((m) => F.sel.has(m));
 }
 // Why a write cannot start, naming the one running, as 收藏夹 does.
-const busyWhy = () => W.busy() && `${W.busy()}还在跑，等它完成`;
+const busyWhy = () => UI.busyText(W.busy());
 
 // The selection bar, and what in rows 3 and 4 counts the selection: 全选, 清理 (已出分拣范围) and ✦ AI 打标签.
 function renderSel() {
@@ -831,15 +837,14 @@ function renderSel() {
   if (F.tab !== "ups" || !F.sel.size) return (E.sel.innerHTML = "");
   const hidden = F.sel.size - n;
   const busy = busyWhy();
-  const none = !n && "选中的都被筛选隐藏了";
   // As 收藏夹's selection bar: the buttons that act on B站 say how many, label and aria-label alike.
-  const btn = (act, label, reason, cls = "") => `<button type="button"${cls ? ` class="${cls}"` : ""} data-fw="${act}" aria-label="${esc(label)}"${UI.reasonAttrs(reason)}>${esc(label)}</button>`;
+  const btn = (act, label, reason, cls = "") => UI.actBtn(`data-fw="${act}"`, label, { reason, cls });
   // 移动 leaves the sidebar's group, so 全部 has none to leave.
   // 已出分拣范围: 重新关注 the unfollowed, 取消关注 the ones still followed (清理 is in row 3, as 收藏夹's).
   const gone = selShown().filter((m) => rows.get(m).gone).length;
-  const acts = F.side === "out"
+  const acts = (none) => F.side === "out"
     ? btn("refollow", `重新关注选中的 ${gone} 个`, busy || none || (!gone && "选中的都还关注着")) + btn("unfollow", `取消关注选中的 ${n - gone} 个`, busy || none || (n === gone && "选中的都已取消关注"), "danger")
-    : btn("pick-sel", "标签…", busy || none) +
+    : btn("pick-sel", "标签…", none) +
       btn("move-sel", `移动选中的 ${n} 个到分组…`, busy || none || (groupId(F.side) == null && "先在左边选一个分组：全部里不知道从哪个分组移走")) +
       btn("copy-sel", `复制选中的 ${n} 个到分组…`, busy || none) +
       btn("unfollow", `取消关注选中的 ${n} 个`, busy || none, "danger");
@@ -1058,26 +1063,32 @@ const W = MdgWrites.create({ runs, lane: "follow-write", send, line: (p) => `${p
 // goes again; 停止 ends the run there, keeping what went through (and its undo).
 const WRITE_GAP_MS = 1000;
 const perUp = (mids, msg) => mids.map((mid) => msg(mid));
-// skipped (an array) gets the UP 主 a group request left out ({ mid, error }); they stay selected.
+// skipped (an array) gets the UP 主 a group request left out ({ mid, error }).
+// The UP 主 it went through stay selected while they stay listed here (DESIGN 筛选和计数): those it took out of the
+// sidebar item or 已出分拣范围's tab (取消关注, 重新关注, 移到) leave the selection once the data is read again.
 async function relationRun(calls, label, { quiet = false, skipped = [] } = {}) {
   const chunks = calls.map((c) => ({ msg: c, keys: c.mids || [c.mid], folders: [], gap: WRITE_GAP_MS }));
+  const ran = new Set();
   const running = W.run("follow-write", label, {
     verb: label,
     chunks,
     onChunk(c, r) {
       const left = r?.data?.skipped || [];
       skipped.push(...left);
-      for (const mid of c.keys) if (!left.some((x) => x.mid === mid)) F.sel.delete(mid);
+      for (const mid of c.keys) if (!left.some((x) => x.mid === mid)) ran.add(mid);
       renderSel();
     }
   });
-  renderSel();
+  // The cards too: their B站 buttons are disabled while it runs.
+  render();
   const r = await running;
-  if (r.busy) return toast(`${r.busy}还在跑，等它完成`), 0;
+  if (r.busy) return toast(UI.busyText(r.busy)), 0;
   if (r.stopped) toast(`已停止${label}：完成 ${r.done} 个，未完成 ${r.total - r.done} 个`);
   else if (r.error || r.done < r.total) toast(`${label}第 ${r.done + 1} 个时出错：${r.error || "未知错误"}${r.done ? `（前 ${r.done} 个已完成）` : ""}`, true);
   else if (!quiet) toast(`已${label} ${r.done} 个`);
   await load();
+  const listed = new Set(sideMids(D, rows, F.side).filter((m) => !F.kind || F.side !== "out" || outKind(rows.get(m)) === F.kind));
+  for (const m of ran) if (!listed.has(m)) F.sel.delete(m);
   render();
   return r.done;
 }
@@ -1096,7 +1107,6 @@ async function clean(mids) {
   if (!ok) return;
   const r = await send({ type: "follow-forget", mids });
   if (!r.ok) return toast(`清理失败：${r.error}`, true);
-  for (const m of mids) F.sel.delete(m);
   await load();
   render();
   toast(`已清理 ${mids.length} 个 UP 主`);
@@ -1111,7 +1121,7 @@ function pushWriteUndo(done, { label, backLabel, back, ask = null, groups = fals
     kind: "mode",
     groups,
     ask: done.length > 1 ? ask : null,
-    blocked: () => (W.busy() ? `${W.busy()}还在跑，等它完成再撤销` : ""),
+    blocked: () => UI.busyText(W.busy(), { undo: true }),
     undo: async () => {
       const calls = back();
       const want = calls.reduce((n, c) => n + (c.mids || [c.mid]).length, 0);
@@ -1783,14 +1793,12 @@ main.addEventListener("click", async (e) => {
   } else if (act === "select-none") {
     F.sel.clear();
     render();
-  } else if (W.busy()) toast(busyWhy());
-  else if (act === "pick-sel") openPick(selShown());
+  } else if (act === "pick-sel") openPick(selShown());
+  // 标签… only changes MoonDigest's tags, so a B站 batch does not hold it; the rest write B站 (清理 drops their records).
+  else if (W.busy()) toast(busyWhy());
   else if (act === "unfollow") unfollow(selShown().filter((m) => !rows.get(m).gone));
   else if (act === "refollow") refollow(selShown().filter((m) => rows.get(m).gone));
-  else if (act === "clean") {
-    const sel = shown.filter((m) => F.sel.has(m));
-    clean(cleanable(sel.length ? sel : shown));
-  }
+  else if (act === "clean") clean(cleanTargets().mids);
   else if (act === "move-sel" || act === "copy-sel") moveOrCopy(selShown(), act === "move-sel" ? "move" : "copy");
 });
 // The selection bar sits outside the list; its buttons share the handler above through #followMain.

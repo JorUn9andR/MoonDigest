@@ -372,7 +372,7 @@ assert.deepStrictEqual([t.dirLabel("last", "desc"), t.dirLabel("follow", "asc"),
 assert.ok(/if \(!\/\^follow\(&\|\$\)\/\.test\(h\)\) return false;\s*history\.replaceState\(null, "", location\.pathname \+ location\.search\);/.test(source), "followHash drops the hash");
 
 // #follow&up=<mid> (the B站 tag picker's button) clears what could hide the card, then makes it current.
-assert.ok(/if \(up\) \{\s*F\.tab = "ups";\s*F\.side = rows\.has\(up\) && outKind\(rows\.get\(up\)\) \? "out" : "all";\s*F\.status = F\.tagState = F\.source = F\.kind = F\.q = "";[\s\S]*?F\.tags = new Set\(\);\s*\}/.test(source), "followHash clears the filters for up");
+assert.ok(/if \(up\) \{\s*const side = rows\.has\(up\) && outKind\(rows\.get\(up\)\) \? "out" : "all";[\s\S]*?F\.side = side;\s*F\.status = F\.tagState = F\.source = F\.kind = F\.q = "";[\s\S]*?F\.tags = new Set\(\);\s*\}/.test(source), "followHash clears the filters for up");
 assert.ok(/render\(\);\s*if \(up\) \{\s*setCur\(up, false\);\s*E\.list\.querySelector\("\.fw-up\.focused"\)\?\.scrollIntoView\(\{ block: "center" \}\);/.test(source), "followHash makes the UP current, centered");
 
 // 标签… on 2+ UP 主 is one step that asks before U, with 收藏夹's words (shared.js undoAsk).
@@ -688,6 +688,44 @@ async function followPage({ store = {}, handlers = {}, setup = () => {} } = {}) 
     F.cur = "u3";
     p.key("x");
     assert.ok(found["[data-fw=clean]"].outerHTML?.includes(">清理选中的 1 个<"), "清理 follows the pick");
+    // J2: filters hide the whole selection: still 「清理选中的 1 个」, off with why, and a click cleans nothing.
+    F.tagState = "tagged";
+    p.FW.render();
+    assert.ok(p.$("fwBarR").innerHTML.includes('aria-label="清理选中的 1 个" disabled title="选中的都被筛选隐藏了"'), p.$("fwBarR").innerHTML);
+    const asked = p.asked.length;
+    p.click("followMain", "[data-fw]", { fw: "clean" });
+    await p.settle();
+    assert.strictEqual(p.asked.length, asked, "no 清理 confirm for a hidden selection");
+    F.tagState = "";
+  }
+
+  // J8: an empty list says why: the search, else the filters, else the group is empty.
+  {
+    const p = await followPage({ store: page({ follow_unfollowed: { u3: { at: sec - DAY, source: "app", name: "丙" } }, follow_tags: [{ id: "t1", name: "科普", color: "#111" }], follow_tag_map: { u1: ["t1"] } }) });
+    const { F, E } = p.FW;
+    // J10: row 4's chip says what it lists.
+    assert.ok(E.tagRow.innerHTML.includes('title="可多选：只显示同时带有所选标签的 UP 主"'), E.tagRow.innerHTML);
+    F.side = "g:-10";
+    p.FW.render();
+    assert.ok(E.list.innerHTML.includes("这个分组没有 UP 主"), E.list.innerHTML);
+    F.side = "all";
+    F.tagState = "untagged";
+    F.tags = new Set(["t1"]);
+    p.FW.render();
+    assert.ok(E.list.innerHTML.includes("没有符合筛选的 UP 主"), E.list.innerHTML);
+    F.tagState = "";
+    F.tags = new Set();
+    // J9: #follow&up= into 已出分拣范围 (u3 unfollowed) and back clears the selection, as the sidebar does.
+    const hash = async (up) => {
+      p.ctx.location.hash = `#follow&up=${up}`;
+      for (const f of p.winL.hashchange) await f();
+    };
+    F.sel.add("u1");
+    await hash("u3");
+    assert.deepStrictEqual([F.side, F.sel.size], ["out", 0], "into 已出分拣范围");
+    F.sel.add("u3");
+    await hash("u1");
+    assert.deepStrictEqual([F.side, F.sel.size], ["all", 0], "out of it");
   }
 
   // U on a 关注 write while another runs: refused before its confirm, with 收藏夹's words; the step stays for later.

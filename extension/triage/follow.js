@@ -606,7 +606,7 @@ function renderSyncChanges() {
 // disabled and says why (a run or a proposal stays reachable).
 const aiReason = () => (aiRunning() || AI.proposal ? "" : aiBlocked(F.tab, F.side));
 function renderAiButton() {
-  $("fwAiSlot").innerHTML = UI.tagButtons({ manageAttrs: 'data-fw="tags"', aiAttrs: 'data-fw="ai"', aiReason: aiReason(), noTags: !D.tags.length, picked: F.tab === "ups" ? selShown().length : 0, state: aiRunning() ? " · 运行中" : AI.proposal ? " · 待确认" : "" });
+  $("fwAiSlot").innerHTML = UI.tagButtons({ manageAttrs: 'data-fw="tags"', aiAttrs: 'data-fw="ai"', aiReason: aiReason(), noTags: !D.tags.length, picked: F.tab === "ups" ? F.sel.size : 0, state: aiRunning() ? " · 运行中" : AI.proposal ? " · 待确认" : "" });
 }
 function renderAiState() {
   renderSync();
@@ -649,10 +649,7 @@ function renderTabs() {
   // 已出分拣范围 has no 视频投稿; its tabs are why the UP 主 left (outKind), 全部 first.
   if (F.side === "out") {
     const all = sideMids(D, rows, "out");
-    E.tabs.innerHTML = [["", "全部"], ...OUT_KINDS].map(([k, label]) => {
-      const n = k ? all.filter((m) => outKind(rows.get(m)) === k).length : all.length;
-      return `<button type="button" role="tab" class="${n ? "step" : "step zero"}" data-fwkind="${k}" aria-selected="${F.kind === k}">${label}<span class="count">${n}</span></button>`;
-    }).join("");
+    E.tabs.innerHTML = UI.kindTabs("data-fwkind", [["", "全部"], ...OUT_KINDS].map(([k, label]) => [k, label, k ? all.filter((m) => outKind(rows.get(m)) === k).length : all.length]), F.kind);
     return;
   }
   E.tabs.innerHTML = tab("ups", "UP 主", sideCount("all")) + tab("feed", "视频投稿");
@@ -681,11 +678,7 @@ function stateRowUps(counts) {
 const tagRowHtml = (counts) =>
   D.tags
     .filter((t) => counts[t.id] || F.tags.has(t.id))
-    .map((t) => {
-      const on = F.tags.has(t.id);
-      const n = counts[t.id] || 0;
-      return `<button type="button" class="chip${on ? " on" : ""}${n ? "" : " zero"}" style="--c:${esc(t.color)}" data-fw-tag="${esc(t.id)}" aria-pressed="${on}" aria-label="按标签筛选 ${esc(t.name)} ${n}" title="可多选：只显示同时带有所选标签的">${esc(t.name)}<span class="chip-n">${n}</span></button>`;
-    })
+    .map((t) => UI.tagFilterChip(`data-fw-tag="${esc(t.id)}"`, { name: t.name, color: t.color, on: F.tags.has(t.id), n: counts[t.id] || 0, what: F.tab === "feed" ? "UP 主的视频" : "UP 主" }))
     .join("");
 // Anything in rows 3 and 4 narrowing the list (for 「N 个结果」); the sidebar is scope, as 收藏夹's folder.
 const filtersOn = () => (F.side === "out" ? Boolean(F.source || F.tagState || F.tags.size) : Boolean(F.tagState || F.tags.size || (F.tab === "ups" && (F.status || F.recentFilter))));
@@ -719,7 +712,7 @@ function renderUps() {
   const scroll = E.list.scrollTop;
   let body;
   if (!D.list && !out) body = emptyHtml();
-  else if (!list.length) body = `<p class="empty">${out && !sideCount("out") ? "没有已出分拣范围的 UP 主" : UI.noMatch(F.q, true, "UP 主")}</p>`;
+  else if (!list.length) body = `<p class="empty">${UI.noMatch(F.q, filtersOn(), "UP 主") || (out && !F.kind ? "没有已出分拣范围的 UP 主" : F.side.startsWith("g:") ? "这个分组没有 UP 主" : "这里没有 UP 主")}</p>`;
   else body = list.map(upCard).join("");
   E.list.className = "fw-list";
   E.list.innerHTML = hint + body;
@@ -727,18 +720,22 @@ function renderUps() {
   renderSel();
 }
 
-// 清理, as 收藏夹's: it only forgets (B站 is untouched), so it takes the 已取消关注 among the selected listed ones, else among
-// all listed. The ones still followed are left out: they would come back with the next 刷新, so 取消关注 comes first.
+// 清理, as 收藏夹's: it only forgets (B站 is untouched), so it takes the 已取消关注 among the selected listed ones (none
+// when filters hide them all), else among all listed. The ones still followed are left out: they would come back with
+// the next 刷新, so 取消关注 comes first.
 const cleanable = (mids) => mids.filter((m) => rows.get(m)?.gone);
-// What 清理 takes from list: { picked: whether it is the selection, mids }.
+// What 清理 takes from list: { picked: whether there is a selection, mids }.
 function cleanTargets(list = shown) {
-  const sel = list.filter((m) => F.sel.has(m));
-  return { picked: sel.length > 0, mids: cleanable(sel.length ? sel : list) };
+  const picked = F.sel.size > 0;
+  return { picked, mids: cleanable(picked ? list.filter((m) => F.sel.has(m)) : list) };
 }
 function cleanBtn(list) {
   const { picked, mids } = cleanTargets(list);
-  const why = busyWhy() || (!list.length ? "这里没有列出 UP 主" : !mids.length ? "还关注着的先取消关注，再清理" : "");
-  return UI.cleanBtn('data-fw="clean"', picked, mids.length, why);
+  const shownSel = list.filter((m) => F.sel.has(m)).length;
+  // All of it hidden: the count is the whole selection's.
+  const n = picked && !shownSel ? cleanable([...F.sel]).length : mids.length;
+  const why = !list.length ? "这里没有列出 UP 主" : !mids.length ? "还关注着的先取消关注，再清理" : "";
+  return UI.cleanBtn('data-fw="clean"', { picked: F.sel.size, shown: shownSel, n, busy: busyWhy(), why });
 }
 
 function emptyHtml() {
@@ -786,14 +783,13 @@ function upCard(mid) {
   // Its 关注分组, as 收藏夹's 原在「A」: where the unfollowed were (records from before groups were kept have none), where
   // the still followed are. Groups deleted since are left out; none of your own is 默认分组.
   const gids = kind === "gone" ? u.gone.groups : kind ? groupsOf(mid, D) : null;
-  const gnames = gids ? (gids.length ? gids.map((id) => groupName(id, D)).filter(Boolean) : ["默认分组"]).map((n) => `「${n}」`) : [];
-  const pre = kind === "gone" ? "原在" : "在";
-  const origin = gnames.length ? `<span class="origin-chip" title="${esc(pre + gnames.join(""))}">${esc(gnames.length > 2 ? `${pre}${gnames.slice(0, 2).join("")}等 ${gnames.length} 个` : pre + gnames.join(""))}</span>` : "";
+  const gnames = gids ? (gids.length ? gids.map((id) => groupName(id, D)).filter(Boolean) : ["默认分组"]) : [];
+  const origin = UI.originChip(kind === "gone" ? "原在" : "在", gnames);
   const chips = u.tagIds.map(tagOf).map((t) => u.gone
     ? `<span class="chip" style="--c:${esc(t.color)}">${esc(t.name)}</span>`
     : UI.cardTagChip(t, "点一下去掉这个标签")).join("");
   const titles = u.titles.length
-    ? `<ul class="fw-titles">${u.titles.map((v) => `<li>${v.bvid ? `<a class="fw-title" href="${esc(video(v.bvid))}" data-play="${esc(v.bvid)}" title="在右侧播放">${esc(v.t)}</a>` : `<span class="fw-title">${esc(v.t)}</span>`}<span class="meta">${UI.agoHtml(v.c, now)}</span></li>`).join("")}</ul>`
+    ? `<ul class="fw-titles">${u.titles.map((v) => `<li>${v.bvid ? `<a class="fw-title" href="${esc(video(v.bvid))}" data-play="${esc(v.bvid)}" title="在分拣台里播放">${esc(v.t)}</a>` : `<span class="fw-title">${esc(v.t)}</span>`}<span class="meta">${UI.agoHtml(v.c, now)}</span></li>`).join("")}</ul>`
     : "";
   // While a B站 batch runs, the buttons that write B站 (and 清理, which drops the records those batches write) are
   // disabled with why; the handler's guard is left for other paths.
@@ -807,7 +803,7 @@ function upCard(mid) {
   return `<article class="card fw-up${sel ? " selected" : ""}${playing ? " playing" : ""}${F.cur === mid ? " focused" : ""}" data-mid="${esc(mid)}" aria-label="${esc(u.name)}">
     <a class="fw-avatar" href="${space(mid)}" target="_blank" rel="noopener" tabindex="-1" aria-hidden="true">${u.face ? `<img src="${esc(img(u.face, "96w_96h_1c"))}" alt="" loading="lazy" referrerpolicy="no-referrer">` : ""}</a>
     <div class="card-body">
-      <div class="fw-name-row"><a class="fw-name" href="${space(mid)}" data-space="${esc(mid)}" target="_blank" rel="noopener" title="在右侧打开空间">${esc(u.name)}</a>${kind ? "" : checking() === mid ? '<span class="badge running" aria-busy="true">查投稿中…</span>' : `<span class="badge ${STATUS_BADGE[u.status]}">${STATUS_TEXT[u.status]}</span>`}${u.ov ? `<span class="meta fw-ov" title="${esc(u.ov)}">${esc(u.ov)}</span>` : ""}</div>
+      <div class="fw-name-row"><a class="fw-name" href="${space(mid)}" data-space="${esc(mid)}" target="_blank" rel="noopener" title="在分拣台里打开空间">${esc(u.name)}</a>${kind ? "" : checking() === mid ? '<span class="badge running" aria-busy="true">查投稿中…</span>' : `<span class="badge ${STATUS_BADGE[u.status]}">${STATUS_TEXT[u.status]}</span>`}${u.ov ? `<span class="meta fw-ov" title="${esc(u.ov)}">${esc(u.ov)}</span>` : ""}</div>
       ${left ? `<div class="left-row">${origin}${left}</div>` : ""}
       ${meta.length ? `<div class="meta">${meta.join(" · ")}</div>` : ""}
       ${u.sign ? `<div class="fw-sign" title="${esc(u.sign)}">${esc(u.sign)}</div>` : ""}
@@ -844,7 +840,7 @@ function renderSel() {
   const acts = (none) => F.side === "out"
     ? btn("refollow", `重新关注选中的 ${gone} 个`, busy || none || (!gone && "选中的都还关注着")) + btn("unfollow", `取消关注选中的 ${n - gone} 个`, busy || none || (n === gone && "选中的都已取消关注"), "danger")
     : btn("pick-sel", "标签…", none) +
-      btn("move-sel", `移动选中的 ${n} 个到分组…`, busy || none || (groupId(F.side) == null && "先在左边选一个分组：全部里不知道从哪个分组移走")) +
+      btn("move-sel", `移动选中的 ${n} 个到分组…`, busy || none || (groupId(F.side) == null && "先在分组列表里选一个分组：「全部」里不知道从哪个分组移走")) +
       btn("copy-sel", `复制选中的 ${n} 个到分组…`, busy || none) +
       btn("unfollow", `取消关注选中的 ${n} 个`, busy || none, "danger");
   E.sel.innerHTML = UI.selbar({ label: "选中的 UP 主", n, hidden, clearAttrs: 'data-fw="select-none"', acts });
@@ -927,7 +923,7 @@ function feedCard(it) {
     <a class="cover-wrap" href="${esc(video(it.bvid))}" data-play="${esc(it.bvid)}" tabindex="-1" aria-hidden="true">${it.cover ? `<img class="cover" src="${esc(img(it.cover, "480w_270h_1c"))}" alt="" loading="lazy" referrerpolicy="no-referrer">` : ""}<span class="cover-dur">${it.duration ? esc(fmtDuration(it.duration)) : ""}</span></a>
     <div class="fw-video-body">
       <a class="title" href="${esc(video(it.bvid))}" data-play="${esc(it.bvid)}" title="${esc(it.title)}" aria-label="播放 ${esc(it.title)}">${esc(it.title)}</a>
-      <div class="meta fw-video-meta"><a class="fw-up-link" href="${space(it.mid)}" data-space="${esc(it.mid)}" title="在右侧打开空间" target="_blank" rel="noopener">${it.face ? `<img src="${esc(img(it.face, "48w_48h_1c"))}" alt="" loading="lazy" referrerpolicy="no-referrer">` : ""}<span>${esc(it.name)}</span></a>${UI.agoHtml(it.at, nowSec())}${it.play ? `<span>▶ ${esc(fmtCount(it.play))}</span>` : ""}</div>
+      <div class="meta fw-video-meta"><a class="fw-up-link" href="${space(it.mid)}" data-space="${esc(it.mid)}" title="在分拣台里打开空间" target="_blank" rel="noopener">${it.face ? `<img src="${esc(img(it.face, "48w_48h_1c"))}" alt="" loading="lazy" referrerpolicy="no-referrer">` : ""}<span>${esc(it.name)}</span></a>${UI.agoHtml(it.at, nowSec())}${it.play ? `<span>▶ ${esc(fmtCount(it.play))}</span>` : ""}</div>
       <div class="chips">${chips}${addBtn(it.mid, it.name)}</div>
     </div>
   </article>`;
@@ -1516,10 +1512,12 @@ function setAiProposal(p) {
   else chrome.storage.local.remove("follow_ai_proposal");
 }
 
-function aiScopeMids(scope) {
+// The AI tags only UP 主 still followed.
+const followedOf = (mids) => {
   const live = new Set(following());
-  return (scope === "selected" ? selShown() : F.side === "out" ? [] : [...shown]).filter((m) => live.has(m));
-}
+  return mids.filter((m) => live.has(m));
+};
+const aiScopeMids = (scope) => followedOf(scope === "selected" ? selShown() : F.side === "out" ? [] : [...shown]);
 async function openAi() {
   if (!aiRunning()) {
     AI.settings = await aiSettings();
@@ -1543,11 +1541,11 @@ const aiTags = {
   tags: () => D.tags,
   scopes: () => [
     { value: "filter", label: "当前筛选", n: aiScopeMids("filter").length },
-    { value: "selected", label: "选中", n: aiScopeMids("selected").length }
+    { value: "selected", label: "选中", n: followedOf([...F.sel]).length, shown: aiScopeMids("selected").length }
   ],
   scopeText: aiScopeText,
   room: () => AI.settings.newTagMax,
-  roomHint: () => `${AI.settings.newTagMax ? `AI 这次最多新建 ${AI.settings.newTagMax} 个标签，你确认后才创建。` : "AI 只会用已有标签。"}<br>每批数量、间隔和新建上限在左下角的「关注设置」里改。`,
+  roomHint: () => `${AI.settings.newTagMax ? `AI 这次最多新建 ${AI.settings.newTagMax} 个标签，你确认后才创建。` : "AI 只会用已有标签。"}<br>每批数量、间隔和新建上限在「关注设置」里改。`,
   blocked: () => aiBlocked(F.tab, F.side),
   history: () => AI.history,
   allowRemove: () => AI.settings.allowRemove,
@@ -1912,8 +1910,11 @@ async function followHash() {
   const up = params.get("up");
   if (F.mode !== "follow") await setMode("follow");
   if (up) {
+    const side = rows.has(up) && outKind(rows.get(up)) ? "out" : "all";
+    // Into or out of 已出分拣范围 clears the selection, as the sidebar does.
+    if (side === "out" || F.side === "out") freshScope(side);
     F.tab = "ups";
-    F.side = rows.has(up) && outKind(rows.get(up)) ? "out" : "all";
+    F.side = side;
     F.status = F.tagState = F.source = F.kind = F.q = "";
     E.q.value = "";
     F.recentFilter = false;

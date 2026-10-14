@@ -3141,7 +3141,7 @@ function aiItem(it) {
 
 
 // Titles one 粗看 request carries (a fixed size; the output limit's 自动 grows with it).
-const TITLES_PER_REQUEST = 30;
+const TITLES_PER_REQUEST = 20;
 
 // What 标题粗看 counts and sends: the first coarseBatchSize() 未分析 videos listed now (search and filters applied),
 // not the hidden ones. A selection wins, like 细看's nextBatch.
@@ -4233,8 +4233,8 @@ function bindEvents() {
       triageCoarseBatchSize: UI.intIn(el.coarseBatchInput.value, 1, 1000, 100),
       triageFineBatchSize: UI.intIn(el.fineBatchInput.value, 1, 50, 10),
       triageThinking: el.thinkingInput.checked,
-      triageTitleMaxTokens: Number(el.titleMaxInput.value) || 0,
-      triageAnalyzeMaxTokens: Number(el.analyzeMaxInput.value) || 0,
+      triageTitleMaxTokens: UI.intIn(el.titleMaxInput.value, 200, 32000, 0),
+      triageAnalyzeMaxTokens: UI.intIn(el.analyzeMaxInput.value, 200, 32000, 0),
       triageTagLimit: UI.intIn(el.tagLimitInput.value, 1, 50, 10),
       triageAiNewTagMax: UI.intIn(el.aiNewTagMaxInput.value, 0, 50, 5),
       triageAiRemoveTags: el.aiRemoveTagsInput.checked

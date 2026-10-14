@@ -241,8 +241,12 @@
 
   // 标签管理 and ✦ AI 打标签 at the right end of the tag row, next to the tags they act on (in 收藏夹 those are the open
   // folder's, so they do not sit in the sidebar). state is 「 · 运行中」 or 「 · 待确认」. noTags puts the dot on 标签管理.
-  const tagButtons = ({ manageAttrs, aiAttrs, state = "", manageReason = "", aiReason = "", noTags = false }) =>
-    `<span class="tags-acts"><button type="button" class="act-btn" ${manageAttrs}${noTags && !manageReason ? ' aria-label="标签管理（还没有自定义标签）"' : ""}${reasonAttrs(manageReason)}>标签管理${noTags && !manageReason ? WARN_DOT : ""}</button><button type="button" class="act-btn" ${aiAttrs}${reasonAttrs(aiReason)}>${AI_SPARK}AI 打标签${esc(state)}</button></span>`;
+  // picked: the selected ones listed now; the dialog then opens on 选中, so the button says how many, as 粗看's does.
+  // It stays in row 4: the selection bar has no AI 打标签 of its own.
+  const tagButtons = ({ manageAttrs, aiAttrs, state = "", manageReason = "", aiReason = "", noTags = false, picked = 0 }) => {
+    const ai = `AI 打标签${picked && !state && !aiReason ? `选中 ${picked} 个` : ""}`;
+    return `<span class="tags-acts"><button type="button" class="act-btn" ${manageAttrs}${noTags && !manageReason ? ' aria-label="标签管理（还没有自定义标签）"' : ""}${reasonAttrs(manageReason)}>标签管理${noTags && !manageReason ? WARN_DOT : ""}</button><button type="button" class="act-btn" ${aiAttrs} aria-label="${ai} (I)"${reasonAttrs(aiReason)}>${AI_SPARK}${ai}${esc(state)}</button></span>`;
+  };
 
   // Row 3's 全选: a checkbox drawn as a button, for what is listed now (n, of which picked are selected). Unchecked or
   // mixed: a click selects them all; checked: it deselects them. Selections hidden by filters are not its business.
@@ -415,7 +419,7 @@
   // Settings rows both dialogs have: the same name and hint. Each .set-row contains its input.
   const SET_ROWS = {
     interval: ["请求间隔（秒）", ""],
-    // 收藏夹 stores it as triageAiBatchSize (triageTitleBatchSize until first saved), 关注 in follow_ai_settings.batchSize.
+    // 收藏夹 stores it as triageAiBatchSize, 关注 in follow_ai_settings.batchSize.
     aiBatch: ["AI 打标签每批数量", "1–100 个一批。"],
     newTagMax: ["AI 打标签时最多新建几个标签", "0–50，0 = 只用已有标签。"],
     allowRemove: ["AI 打标签时允许去掉已有标签", "关时只加标签。开了也要你确认。"]

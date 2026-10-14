@@ -26,6 +26,10 @@
     biliLogin: "未登录 B站：先在这个浏览器里登录 B站",
     // What a page that can reload adds to subtitleMissing's 未登录 sentence (the video page, the side panel); notes do not.
     subtitleLoginHint: "登录 B站后刷新网页",
+    // A write to Obsidian that failed without the background saying why (video page, side panel, history page).
+    obsidianWriteFailed: "Local API 写入失败",
+    // A dropped connection (fetch's TypeError): the video page, 分拣台's B站 requests, 关注's paused refresh.
+    network: "网络断了",
     // 继续问 on a record that is not a video (the side panel's input, 视频记录's button).
     notVideo: "不是视频，不能问",
     // Every selection is hidden by a search or filter: the buttons that act on it are disabled with this (分拣台, 视频记录).

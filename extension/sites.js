@@ -1312,12 +1312,6 @@
     }
   }
 
-  async function removeSubtitleCache(key) {
-    try {
-      await chrome.storage.local.remove(key);
-    } catch {}
-  }
-
   // A cached body that accept() rejects is fetched again; only an accepted body is cached. io.fresh skips the read (the
   // video page's load, so an old entry never stands in for what the site serves now).
   async function fetchRawCached(site, track, { videoId, cid }, io, accept = (body) => body.length > 0) {
@@ -1475,7 +1469,7 @@
     normalizeSubtitleLang,
     pickPreferredTrack,
     trackUrlKey,
-    subtitleCache: { key: subtitleCacheKey, load: loadSubtitleCache, save: saveSubtitleCache, remove: removeSubtitleCache },
+    subtitleCache: { key: subtitleCacheKey, load: loadSubtitleCache, save: saveSubtitleCache },
     validateSubtitleByDuration,
     fetchRawCached,
     loadFirstTrack,

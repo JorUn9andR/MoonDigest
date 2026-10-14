@@ -215,7 +215,7 @@ const golden = {
       "第一件事是",
       "最后总结一下",
       "",
-      "## 评论",
+      "## 热门评论",
       "",
       "1. 观众A（赞 120）",
       "讲得很清楚",
@@ -264,7 +264,7 @@ const golden = {
       "",
       "## 待办",
       "",
-      "## 评论",
+      "## 热门评论",
       "",
       "1. 观众A（赞 120）",
       "讲得很清楚",
@@ -356,7 +356,7 @@ assert.strictEqual(N.buildMarkdown({ ...cases.biliSingle.meta, aiTurns: turns },
 for (const c of [cases.biliSingle, cases.youtube]) {
   const note = N.buildMarkdown(c.meta, c.body, { ...c.settings, includeHotCommentsInNote: false }, refOf(c.meta));
   const ai = N.buildAiContext(c.meta, c.body, { ...c.settings, includeHotCommentsInNote: true }, refOf(c.meta));
-  assert.ok(!ai.includes("## 评论"), "no hot comments");
+  assert.ok(!ai.includes("## 热门评论"), "no hot comments");
   assert.ok(note.includes("<iframe") && !ai.includes("<iframe"), c.meta.title);
   assert.strictEqual(ai, note.replace(/<iframe[^\n]*\n\n/, ""), "nothing else differs");
 }
@@ -428,8 +428,10 @@ assert.strictEqual(N.withTriageSummary(front, undefined, "  "), front);
   assert.deepStrictEqual(plain(N.triageExtrasKeys({ site: "bilibili", videoId: "" })), []);
 }
 assert.strictEqual(N.buildTriageSummary({ status: "done", verdict: "unsure", reason: "核心" }), "AI 判断：拿不准，核心");
+// A verdict left from the old custom tiers reads 拿不准, as MdgTagCore.verdictOf says on 分拣台 and B站 pages.
+assert.strictEqual(N.buildTriageSummary({ status: "done", verdict: "must", reason: "旧档" }), "AI 判断：拿不准，旧档");
 
-assert.strictEqual(N.buildTriageSummary({ status: "done", oneLiner: "一句话", points: ["a", "", ""] }), "> 一句话\n\n- a", "padded empty points are dropped");
+assert.strictEqual(N.buildTriageSummary({ status: "done", oneLiner: "一句话", points: ["a", "", ""] }), "> 一句话\n\n- a\n\nAI 判断：拿不准", "padded empty points are dropped");
 assert.strictEqual(
   N.renderMarkdown("<think>x</think>## 标题\n\n**粗** <b>\n\n- a\n- b"),
   "<h4>标题</h4><p><strong>粗</strong> &lt;b&gt;</p><ul><li>a</li><li>b</li></ul>",

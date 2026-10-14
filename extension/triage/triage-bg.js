@@ -274,7 +274,7 @@ async function triageBiliFetch(url, init = {}) {
   } catch (e) {
     ctl.abort();
     // A dropped connection is fetch's TypeError, whose English text the user does not need.
-    throw triageError(e?.name === "TypeError" ? "网络断了" : `网络断了：${e?.message || e}`, "NETWORK");
+    throw triageError(e?.name === "TypeError" ? MdgErrors.TEXT.network : `${MdgErrors.TEXT.network}：${e?.message || e}`, "NETWORK");
   } finally {
     clearTimeout(timer);
   }
@@ -359,12 +359,12 @@ async function triageToviewList() {
 // Bilibili keeps about three months of history. Only what is new since the last read is fetched, at most every
 // SEEN_GAP_MS and only when a page asks (the triage page or a Bilibili page opening), so it reads no more than the user
 // browsing their own history page would. Each video keeps two numbers under seen_<bvid>: [best percent, last view_at].
-const SEEN_GAP_MS = 10 * 60 * 1000;
+const SEEN_GAP_MS = MdgLimits.SEEN_GAP_MS;
 const SEEN_BACKOFF_MS = 30 * 60 * 1000;
 const SEEN_PAGE_GAP_MS = 5000;
 const SEEN_MAX_PAGES = 60;
-const SEEN_KEEP_S = 365 * 86400;
-const SEEN_MAX = 5000;
+const SEEN_KEEP_S = MdgLimits.SEEN_KEEP_DAYS * 86400;
+const SEEN_MAX = MdgLimits.SEEN_MAX;
 const SEEN_PRUNE_GAP_MS = 86400 * 1000;
 const SEEN_PREFIX = MdgLimits.KEYS.seenPrefix;
 const SEEN_META = MdgLimits.KEYS.triageSeenMeta; // { newest: view_at s, syncedAt, prunedAt, backoffUntil, resume }
@@ -523,7 +523,8 @@ const TRIAGE_SETTINGS_DEFAULTS = {
   triageAnalyzeMaxTokens: null,
   triageTagLimit: null,
   triageAiNewTagMax: null,
-  triageAiRemoveTags: false
+  triageAiRemoveTags: false,
+  triageAiBatchSize: null
 };
 
 // 输出上限：用户填了正数就用用户的，否则按是否思考自动（思考 token 计入 max_tokens）
@@ -987,6 +988,7 @@ const TRIAGE_HANDLERS = {
       triageTagLimit: TriageUi.numSetting("tagLimit", s.triageTagLimit),
       triageAiNewTagMax: TriageUi.numSetting("newTagMax", s.triageAiNewTagMax),
       triageAiRemoveTags: s.triageAiRemoveTags === true,
+      triageAiBatchSize: TriageUi.numSetting("aiBatch", s.triageAiBatchSize),
       // 开启思考 only reaches these platforms (triageChat), so the page shows the switch only when the platform the
       // requests go to (triageProvider) is one of them.
       thinkingToggle: supportsThinkingToggle(provider?.baseUrl)

@@ -23,17 +23,12 @@ const el = {
   settingsBtn: document.getElementById("settingsBtn")
 };
 
-const NOT_VIDEO_PAGE = "当前网页不是支持的视频页";
+const NOT_VIDEO_PAGE = MdgErrors.TEXT.notVideoPage;
 let latestPayload = null;
 // Set from the tab's URL in init(): a content script that still answers on a non-video page must not re-enable the tools.
 let onVideoPage = true;
 // Only for when get-settings fails.
 const DEFAULT_SETTINGS = MdgSettings.DEFAULTS;
-
-function formatLocalDate(value = Date.now()) {
-  const date = value instanceof Date ? new Date(value.getTime()) : new Date(value);
-  return `${date.getFullYear()}-${String(date.getMonth() + 1).padStart(2, "0")}-${String(date.getDate()).padStart(2, "0")}`;
-}
 
 init().catch((error) => {
   setStatus(`初始化失败：${error.message}`, true);
@@ -43,10 +38,16 @@ async function init() {
   bindEvents();
   const tab = await getActiveTab();
   onVideoPage = isSupportedSubtitlePage(tab?.url || "");
-  if (!onVideoPage) syncTools(null, false);
   getSettingsFromRuntime().then((settings) => {
     el.sendBtn.hidden = settings.obsidianEnabled !== true;
   });
+  // A web page has nothing to read: say so instead of a failed fetch.
+  if (!onVideoPage) {
+    syncTools(null, false);
+    setDisabledReason(el.refreshBtn, NOT_VIDEO_PAGE);
+    setStatus(NOT_VIDEO_PAGE);
+    return;
+  }
   // Opening shows the video as the page has it (starting a read only when nothing is loaded); 刷新 reads it again.
   await refreshFromTab();
 }
@@ -95,7 +96,8 @@ function bindEvents() {
       setStatus("没有可下载内容，请先刷新", true);
       return;
     }
-    MdgDownload.text(`${sanitizeFileName(payload.title || "video-subtitle")}.md`, payload.markdown);
+    // Named like the note 写入 Obsidian writes (date prefix setting, 分 P): the content script builds it.
+    MdgDownload.text(payload.filename, payload.markdown);
     setStatus("已下载 .md");
   });
 
@@ -234,7 +236,7 @@ function render(payload, { preserveStatus = false } = {}) {
 
   setText(el.propTitle, payload.title || "-");
   setText(el.propUrl, payload.url || "-");
-  setText(el.propCreated, formatLocalDate());
+  setText(el.propCreated, MdgDownload.dateStamp());
   setText(el.propTags, payload.tags || "MoonDigest");
   el.propTitle.title = payload.title || "";
   setText(el.videoTitle, payload.title);

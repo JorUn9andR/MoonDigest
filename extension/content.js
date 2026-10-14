@@ -528,12 +528,7 @@ function bindRuntimeEvents() {
         sendResponse({ ok: false, error: "当前页面没有找到可联动的视频播放器。" });
         return false;
       }
-      const nextTime = Math.max(0, Number.isFinite(seconds) ? seconds : 0);
-      const wasPaused = Boolean(video.paused);
-      video.currentTime = nextTime;
-      if (!wasPaused) {
-        video.play().catch(() => {});
-      }
+      const nextTime = seekVideo(video, seconds);
       if (state.readingViewOpen) {
         state.readingManualScrollPauseUntil = 0;
         state.readingNextScrollBehavior = "auto";
@@ -575,17 +570,11 @@ function bindSettingsWatcher() {
         rebuildDerivedContent();
       });
     }
-    if (
-      !changes.enablePlayerAiQuickAction &&
-      !changes.aiProviders &&
-      !changes.playerAiQuickPrompt &&
-      !changes.readerTheme &&
-      !changes.readerFontScale &&
-      !changes.readerLetterSpacing &&
-      !changes.readerLineHeight &&
-      !changes.readerContentWidth &&
-      !changes.readerChapterVisible
-    ) {
+    // Any setting (sync keys of MdgSettings.DEFAULTS) or the AI platforms. Note settings (附带热门评论, 笔记属性, 笔记标签…)
+    // shape the note: the popup copies and downloads state.markdown and the side panel builds from state.settings, so
+    // both rebuild here, like 写入 Obsidian, which builds with the settings of the moment.
+    const changed = areaName === "sync" && Object.keys(changes).some((k) => k === "aiProviders" || Object.hasOwn(MdgSettings.DEFAULTS, k));
+    if (!changed) {
       return;
     }
 
@@ -595,6 +584,7 @@ function bindSettingsWatcher() {
         hydrateReaderStateFromSettings(settings);
         applyReadingViewPresentation();
         schedulePlayerAiQuickActionSync();
+        if (state.markdown && runId === state.fetchRunId) refreshDerivedContent().catch(() => {});
       })
       .catch((error) => {
         logWarn("[MDG] failed to refresh settings after storage change", error);
@@ -865,9 +855,8 @@ function checkUrlChange() {
         }
       });
     });
-    return;
   }
-  setStatus("检测到页面变化，请点击「刷新」加载当前视频字幕。");
+  // Out of 专注模式 nothing is read here: the next entry that asks (popup, side panel, player ✦) reads it via settledClip.
 }
 
 function resetClipState() {
@@ -1024,7 +1013,7 @@ async function runRefreshClip() {
     const site = currentSite();
     const ref = site?.parseRef(location.href);
     if (!ref) {
-      throw new Error("当前网页不是支持的视频页");
+      throw new Error(MdgErrors.TEXT.notVideoPage);
     }
     state.site = ref.site;
     state.videoId = ref.id;
@@ -1282,6 +1271,8 @@ function getPopupPayload() {
     message: state.messageText || "",
     subtitlePreview: buildSubtitlePreview(state.subtitleBody || [], state.settings || DEFAULT_SETTINGS),
     markdown: state.markdown || "",
+    // 下载 .md: the same name as the note 写入 Obsidian writes (MdgNote.buildNoteFilename).
+    filename: MdgNote.buildNoteFilename(state, state.settings || DEFAULT_SETTINGS),
     srt: state.srt || "",
     txt: state.txt || "",
     subtitleOptions
@@ -1567,7 +1558,8 @@ function maybeRefreshReaderSubtitleInBackground() {
     if (runId !== state.fetchRunId) {
       return;
     }
-    settledClip(true).catch((error) => setReadingNotice(`字幕加载失败：${fetchErrorText(error)}`));
+    // Joins a read in flight or reads a video not read yet; a video already read without subtitles is not reread.
+    settledClip(false).catch((error) => setReadingNotice(`字幕加载失败：${fetchErrorText(error)}`));
   });
 }
 
@@ -3720,15 +3712,20 @@ function jumpReadingTarget(seconds) {
     return;
   }
 
-  const nextTime = Math.max(0, Number(seconds || 0) || 0);
   state.readingManualScrollPauseUntil = 0;
   state.readingNextScrollBehavior = "auto";
   updateReaderFollowState();
-  video.currentTime = nextTime;
-  if (video.paused) {
-    video.play().catch(() => {});
-  }
+  seekVideo(video, seconds);
   syncReadingViewPlayback(true);
+}
+
+// Every jump to a time point (专注模式 rows and chapters, the side panel's timestamps) keeps a paused video paused.
+function seekVideo(video, seconds) {
+  const nextTime = Math.max(0, Number(seconds) || 0);
+  const wasPaused = Boolean(video.paused);
+  video.currentTime = nextTime;
+  if (!wasPaused) video.play().catch(() => {});
+  return nextTime;
 }
 
 function onReadingChapterClick(event) {

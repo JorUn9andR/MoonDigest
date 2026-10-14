@@ -25,7 +25,11 @@
     // Not logged in to B站 (the background's NOT_LOGGED_IN, B站's -101), on any read or write; pages add 去登录.
     biliLogin: "未登录 B站：先在这个浏览器里登录 B站",
     // What a page that can reload adds to subtitleMissing's 未登录 sentence (the video page, the side panel); notes do not.
-    subtitleLoginHint: "登录 B站后刷新网页"
+    subtitleLoginHint: "登录 B站后刷新网页",
+    // 继续问 on a record that is not a video (the side panel's input, 视频记录's button).
+    notVideo: "不是视频，不能问",
+    // Every selection is hidden by a search or filter: the buttons that act on it are disabled with this (分拣台, 视频记录).
+    hiddenAll: "选中的都被筛选隐藏了"
   });
 
   // Why a reader has no subtitle: the one sentence of every entry (video page, 专注模式, popup, side panel, the AI's
@@ -91,5 +95,15 @@
       .replaceAll('"', "&quot;")
       .replaceAll("'", "&#39;");
 
-  globalThis.MdgErrors = Object.freeze({ TEXT, action, text, fromResp, grantOrigin, reloaded, escapeHtml, subtitleMissing, aiTimeout });
+  // A control that cannot be used is disabled and says why (DESIGN: no clickable button that only toasts): the tooltip,
+  // and aria-description for screen readers; without a reason it is enabled with its own title. Every extension page
+  // and the 分拣台 (TriageUi.setReason) use this one.
+  function setReason(node, reason, title = "") {
+    node.disabled = Boolean(reason);
+    node.title = reason || title;
+    if (reason) node.setAttribute("aria-description", reason);
+    else node.removeAttribute("aria-description");
+  }
+
+  globalThis.MdgErrors = Object.freeze({ TEXT, action, text, fromResp, grantOrigin, reloaded, escapeHtml, setReason, subtitleMissing, aiTimeout });
 })();

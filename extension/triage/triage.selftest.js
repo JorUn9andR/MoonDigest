@@ -423,7 +423,7 @@ const unfavOnlyOf = (d) => Object.fromEntries(Object.entries(d).filter(([, v]) =
     // D on a B站 limit fails at once, worded like every other limit hit.
     handlers["triage-unfav"] = () => ({ ok: false, code: "THROTTLED", error: "412" });
     await t.fav.unfav("BV44");
-    assert.strictEqual(toasts.at(-1), "取消收藏失败：B站限流卡住，请稍后再试");
+    assert.strictEqual(toasts.at(-1), `取消收藏失败：${t.MdgErrors.TEXT.biliThrottled}`);
     assert.ok(t.fav.state().writing("H"), "B站 may have taken it: the folder counts as written");
     handlers["triage-unfav"] = () => ({ ok: true });
     await settled();
@@ -545,9 +545,9 @@ const unfavOnlyOf = (d) => Object.fromEntries(Object.entries(d).filter(([, v]) =
     t.S.analyses.BV1 = { status: "done", source: "subtitle", verdict: "keep" };
     assert.ok(!meta().includes("字幕"));
     t.S.analyses.BV1 = { status: "done", source: "meta", verdict: "keep" };
-    assert.ok(meta().includes("没有字幕，按简介和评论判断"), meta());
+    assert.ok(meta().includes("视频没有字幕，按简介和评论判断"), meta());
     t.S.analyses.BV1.needLogin = true;
-    assert.ok(meta().includes("未登录 B站拿不到字幕，按简介和评论判断"), meta());
+    assert.ok(meta().includes("未登录 B站，拿不到字幕，按简介和评论判断"), meta());
     t.S.analyses.BV1 = { status: "done", source: "meta", verdict: "keep", subtitleFailure: "网络断了" };
     assert.ok(meta().includes("字幕抓取失败：网络断了，按简介和评论判断") && !meta().includes("没有字幕"), meta());
     t.S.analyses.BV1 = { status: "done", source: "subtitle", verdict: "keep", subtitleWarning: "字幕时间轴到 06:40，视频长 04:33，字幕时间可能对不上。" };

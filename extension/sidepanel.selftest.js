@@ -374,11 +374,12 @@ const chatOn = (context) => {
     show(web("x"));
     state.dispatch({ type: "SAVED_CHANGED", list: [{ id: "gone", contextUrl: video.url, contextRef: { url: video.url }, messages: [{ role: "user", content: "q" }] }] });
     state.dispatch({ type: "OPEN", id: "gone" });
-    for (const code of [-404, -352]) {
+    for (const code of [-404, -352, "THROTTLED"]) {
       ctx.resolveConversationContext = async () => ({ ok: false, error: "啥都木有", code });
       assert.strictEqual(await ctx.hydratePinnedConversationContext(), false);
     }
-    assert.deepStrictEqual(errors, ["视频已失效，这段对话只能查看，不能继续提问。", "读取原视频失败：啥都木有"]);
+    // A B站 limit reads as everywhere else (MdgErrors.text), not as the background's own words.
+    assert.deepStrictEqual(errors, ["视频已失效，这段对话只能查看，不能继续提问。", "读取原视频失败：啥都木有", "读取原视频失败：B站限流，请稍后再试"]);
     ctx.resolveConversationContext = realResolve;
   }
 
@@ -408,6 +409,21 @@ const chatOn = (context) => {
     realRenderHistoryList();
     assertInert(els.historyList.innerHTML, "history list");
     assertInert(els.previousVideoBar.innerHTML, "previous video");
+  }
+
+  // Without subtitles the intro says why in the video page's sentence (MdgErrors.subtitleMissing).
+  {
+    let n = 0;
+    const intro = (fields) => {
+      const id = `BV1intro${++n}`;
+      state.dispatch({ type: "NEW" });
+      show({ ...video, url: `https://www.bilibili.com/video/${id}`, videoId: id, subtitleMarkdown: "", ...fields });
+      return ctx.introText();
+    };
+    assert.deepStrictEqual(
+      [intro({}), intro({ subtitleFailure: "网络断了" }), intro({ subtitleNeedLogin: true })],
+      ["视频没有字幕，AI 只能读标题、简介和评论。", "字幕抓取失败：网络断了，AI 只能读标题、简介和评论。", "未登录 B站，拿不到字幕，AI 只能读标题、简介和评论。登录 B站后刷新网页。"]
+    );
   }
 
   console.log("sidepanel selftest: all passed");

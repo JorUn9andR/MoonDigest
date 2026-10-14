@@ -159,7 +159,7 @@ async function getAiSidepanelState(tabId, { forceRefresh = false, frameId = 0, v
   // The page settles its current video (joins a run, follows a URL change) and answers with its comments.
   const resp = await sendMessageToTab(tab.id, { type: "sidepanel-get-context", refresh: forceRefresh, videoId }, inViewer ? { frameId } : {});
   if (!resp?.ok || !resp.payload) {
-    throw new Error(resp?.error || "读取当前页面失败");
+    throw Object.assign(new Error(resp?.error || "读取当前页面失败"), resp?.code != null ? { code: resp.code } : {});
   }
   return { ...resp.payload, url: canonicalVideoUrl(resp.payload), isVideoContext: true };
 }
@@ -344,7 +344,7 @@ async function resolveAiSidepanelContext(contextRef) {
       lang: String(item.label || item.lang || "").trim()
     })),
     // No list because B站 wants a login: the side panel says so instead of 没有字幕, like on the video page.
-    subtitleNeedLogin: bundle.needLogin === true,
+    subtitleNeedLogin: found.needLogin,
     hotComments,
     isVideoContext: true
   };
@@ -548,10 +548,6 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
     const baseUrl = String(message.baseUrl || "").trim();
     const providerId = String(message.providerId || "").trim();
     const model = String(message.model || "").trim();
-    if (!baseUrl) {
-      sendResponse({ ok: false, error: "请填写接口地址" });
-      return false;
-    }
     Promise.resolve()
       .then(async () => {
         const directApiKey = String(message.apiKey || "").trim();
@@ -575,7 +571,7 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
     const forceRefresh = message.forceRefresh === true;
     getAiSidepanelState(tabId, { forceRefresh, frameId: Number(message.frameId) || 0, videoId: String(message.videoId || "") })
       .then((payload) => sendResponse({ ok: true, payload }))
-      .catch((error) => sendResponse({ ok: false, error: error.message }));
+      .catch((error) => sendResponse({ ok: false, error: error.message, code: error.code }));
     return true;
   }
 
@@ -646,7 +642,7 @@ chrome.runtime.onConnect.addListener((port) => {
       abortActiveRequest({ type: "silent" });
       clearActiveRequestState();
       activeAbortController = new AbortController();
-      armWatchdog(STREAM_TIMEOUT_MS.first, `请求超时：${STREAM_TIMEOUT_MS.first / 1000} 秒没有返回，已自动中断，可重试`);
+      armWatchdog(STREAM_TIMEOUT_MS.first, MdgErrors.aiTimeout(STREAM_TIMEOUT_MS.first));
       const providers = await loadAiProviders();
       const provider = providers.find((p) => p.id === msg.providerId);
       if (!provider) {
@@ -965,13 +961,14 @@ function buildAiMessages({ context, userPrompt, history, systemPrompt }) {
   } else if (subtitle.text) {
     sections.push(`以下是视频的字幕全文：\n\n${subtitle.text}`);
   } else {
-    const failure = String(ctx.subtitleFailure || "").trim();
+    // The sentence every entry shows (MdgErrors.subtitleMissing); not logged in or failed, the video may have subtitles.
+    const missing = MdgErrors.subtitleMissing({ subtitleNeedLogin: ctx.subtitleNeedLogin, subtitleFailure: String(ctx.subtitleFailure || "").trim() });
     sections.push(
-      failure
-        ? `这个视频的字幕抓取失败（${failure}），视频本身可能有字幕，不要说视频没有字幕。你拿不到视频里说了什么或画面内容，以下仅基于简介和评论回答，不要假装看过视频；简介和评论回答不了的，告诉用户字幕抓取失败、可稍后刷新重试。`
+      ctx.subtitleNeedLogin || String(ctx.subtitleFailure || "").trim()
+        ? `${missing}。视频本身可能有字幕，不要说视频没有字幕。你拿不到视频里说了什么或画面内容，以下仅基于简介和评论回答，不要假装看过视频；简介和评论回答不了的，告诉用户：${missing}。`
         : "这个视频没有字幕，你拿不到视频里说了什么或画面内容。只能依据下面的简介和评论回答，不要假装看过视频；简介和评论回答不了的，直接告诉用户无法确认。"
     );
-    notices.push(`${ctx.subtitleNeedLogin ? "B站要求登录后才提供字幕" : failure ? "字幕抓取失败" : "这期视频没有字幕"}，只根据标题、简介和评论回答`);
+    notices.push(`${missing}，只根据标题、简介和评论回答`);
     const description = String(ctx.description || "").trim();
     if (description) {
       sections.push(`以下是视频简介：\n\n${description}`);
@@ -1029,13 +1026,8 @@ async function* parseOpenAISSE(response, onActivity) {
       } catch {
         continue;
       }
-      // Some providers report quota, rate and moderation failures inside an HTTP 200 stream. A quota or rate message is
-      // classified as an HTTP 429 (a per-minute quota is 限流, not 余额不足); otherwise only a Chinese message is shown.
-      if (json?.error) {
-        const detail = typeof json.error === "string" ? json.error : json.error.message || JSON.stringify(json.error);
-        if (AI_QUOTA_RE.test(detail) || AI_RATE_RE.test(detail)) throw triageAiHttpError(429, detail);
-        throw new Error(/[\u4e00-\u9fff]/.test(detail) ? `AI 平台返回错误：${detail}` : "AI 平台返回错误");
-      }
+      const bodyError = triageAiBodyError(json);
+      if (bodyError) throw bodyError;
       const delta = json?.choices?.[0]?.delta?.content;
       if (delta) yield String(delta);
     }
@@ -1142,14 +1134,16 @@ function postStreamAbort(port, abortMeta) {
   }
 }
 
+// The settings page's 测试连接 (the one place it checks 接口地址 and 模型名), answered in the words and codes of the side
+// panel and 分拣台: triageAiHttpError, AI_NETWORK_TEXT, hostPermissionError, MdgErrors.aiTimeout.
 async function testAiConnection({ baseUrl, apiKey, model }) {
   const normalizedBaseUrl = String(baseUrl || "").trim().replace(/\/+$/, "");
   const normalizedModel = String(model || "").trim();
   if (!normalizedBaseUrl) {
-    return { ok: false, error: "请填写接口地址" };
+    return { ok: false, error: "请填写接口地址", code: "AI_SETUP" };
   }
   if (!normalizedModel) {
-    return { ok: false, error: "请填写模型名" };
+    return { ok: false, error: "请填写模型名", code: "AI_SETUP" };
   }
 
   return probeAiChatCompletion({
@@ -1181,19 +1175,17 @@ async function probeAiChatCompletion({ baseUrl, apiKey, model }) {
       })
     });
   } catch (error) {
-    if (error?.name === "TimeoutError") return { ok: false, error: `连接超时：${AI_TEST_TIMEOUT_MS / 1000} 秒没有响应` };
-    return { ok: false, error: `无法连接：${error?.message || error}` };
+    if (error?.name === "TimeoutError") return { ok: false, error: MdgErrors.aiTimeout(AI_TEST_TIMEOUT_MS), code: "AI_TIMEOUT" };
+    const denied = await hostPermissionError(baseUrl);
+    return denied ? { ok: false, error: denied } : { ok: false, error: AI_NETWORK_TEXT, code: "AI_NETWORK" };
   }
 
   if (response.ok) {
     return { ok: true };
   }
 
-  let detail = "";
-  try {
-    detail = (await response.text()).slice(0, 200);
-  } catch {}
-  return { ok: false, error: `HTTP ${response.status}${detail ? `: ${detail}` : ""}` };
+  const e = triageAiHttpError(response.status, await response.text().catch(() => ""));
+  return { ok: false, error: e.message, ...(e.code && { code: e.code }) };
 }
 
 // triage/shared.js (loaded at the top) is the pages' TriageUi; it touches no DOM until called, so the worker reuses its

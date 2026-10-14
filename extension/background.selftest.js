@@ -89,7 +89,8 @@ process.on("exit", (code) => {
   ctx.fetch = (url, { signal }) => new Promise((_, reject) => signal.addEventListener("abort", () => reject(abortError())));
   out = await chat();
   assert.deepStrictEqual(out.map((m) => m.type), ["error"]);
-  assert.match(out[0].error, /^请求超时：.* 秒没有返回/);
+  // The same sentence as 分拣台's timeout (MdgErrors.aiTimeout), with the side panel's own limit.
+  assert.strictEqual(out[0].error, ctx.MdgErrors.aiTimeout(vm.runInContext("STREAM_TIMEOUT_MS.first", ctx)));
   assert.strictEqual(out[0].code, "AI_TIMEOUT");
 
   // The side panel and 测试连接 turn thinking off where the platform takes the switch, and send nothing elsewhere.
@@ -107,6 +108,29 @@ process.on("exit", (code) => {
     assert.deepStrictEqual(bodies.map((b) => b.thinking), on ? [{ type: "disabled" }, { type: "disabled" }] : [undefined, undefined], url);
   }
   ctx.loadAiProviders = async () => [{ id: "p", baseUrl: "https://ai.test", model: "m", requiresKey: false }];
+
+  // 测试连接 in the settings page: the side panel's classification, words and codes, never the raw body or English.
+  {
+    const test = (fetch, fields = {}) => ((ctx.fetch = fetch), ctx.testAiConnection({ baseUrl: "https://ai.test/v1", apiKey: "k", model: "m", ...fields }));
+    const was = ctx.hostPermissionError;
+    ctx.hostPermissionError = async () => "";
+    const failed = async () => {
+      throw new TypeError("Failed to fetch");
+    };
+    assert.deepStrictEqual({ ...(await test(async () => ({ ok: false, status: 401, text: async () => '{"error":{"message":"Incorrect API key"}}' }))) }, { ok: false, error: "AI 平台的 API Key 无效或没有权限", code: "AI_AUTH" });
+    assert.deepStrictEqual({ ...(await test(failed)) }, { ok: false, error: "连不上 AI 平台，请检查网络和接口地址", code: "AI_NETWORK" });
+    ctx.hostPermissionError = async () => "未授权访问 https://ai.test，授权后重试";
+    assert.deepStrictEqual({ ...(await test(failed)) }, { ok: false, error: "未授权访问 https://ai.test，授权后重试" });
+    const timeout = async () => {
+      throw Object.assign(new Error("timeout"), { name: "TimeoutError" });
+    };
+    assert.deepStrictEqual({ ...(await test(timeout)) }, { ok: false, error: ctx.MdgErrors.aiTimeout(vm.runInContext("AI_TEST_TIMEOUT_MS", ctx)), code: "AI_TIMEOUT" });
+    assert.deepStrictEqual([{ ...(await test(failed, { baseUrl: " " })) }, { ...(await test(failed, { model: "" })) }], [
+      { ok: false, error: "请填写接口地址", code: "AI_SETUP" },
+      { ok: false, error: "请填写模型名", code: "AI_SETUP" }
+    ]);
+    ctx.hostPermissionError = was;
+  }
 
   // Settings migration: the empty-panel chips fold into the one follow-up list, once.
   const area = (data) => ({
@@ -168,16 +192,18 @@ process.on("exit", (code) => {
   assert.match(none, /这个视频没有字幕/);
   assert.doesNotMatch(none, /抓取失败/);
   const failed = systemFor({ subtitleFailure: "字幕接口限流（429），稍后再试" });
-  assert.match(failed, /字幕抓取失败（字幕接口限流（429），稍后再试）/);
+  assert.match(failed, /字幕抓取失败：字幕接口限流（429），稍后再试。/);
   assert.match(failed, /以下仅基于简介和评论/);
   assert.doesNotMatch(failed, /这个视频没有字幕/);
   assert.match(failed, /以下是视频简介：\n\n简介/);
   assert.doesNotMatch(systemFor({ subtitleMarkdown: "字幕", subtitleFailure: "旧失败" }), /抓取失败/);
   // The user is told too, under the reply: no subtitles, or they failed to load.
   const noticesFor = (extra) => [...ctx.buildAiMessages({ context: { isVideoContext: true, title: "T", ...extra }, userPrompt: "q" }).notices];
-  assert.deepStrictEqual(noticesFor({}), ["这期视频没有字幕，只根据标题、简介和评论回答"]);
-  assert.deepStrictEqual(noticesFor({ subtitleFailure: "429" }), ["字幕抓取失败，只根据标题、简介和评论回答"]);
-  assert.deepStrictEqual(noticesFor({ subtitleFailure: "要登录", subtitleNeedLogin: true }), ["B站要求登录后才提供字幕，只根据标题、简介和评论回答"]);
+  // The three states read as on every other entry (MdgErrors.subtitleMissing).
+  assert.deepStrictEqual(noticesFor({}), ["视频没有字幕，只根据标题、简介和评论回答"]);
+  assert.deepStrictEqual(noticesFor({ subtitleFailure: "429" }), ["字幕抓取失败：429，只根据标题、简介和评论回答"]);
+  assert.deepStrictEqual(noticesFor({ subtitleFailure: "要登录", subtitleNeedLogin: true }), ["未登录 B站，拿不到字幕，只根据标题、简介和评论回答"]);
+  assert.match(systemFor({ subtitleNeedLogin: true }), /未登录 B站，拿不到字幕。视频本身可能有字幕/);
   assert.deepStrictEqual(noticesFor({ subtitleMarkdown: "字幕" }), [], "with subtitles there is nothing to say");
   // A subtitle that does not match the video's length is sent with the video page's warning.
   assert.deepStrictEqual(noticesFor({ subtitleMarkdown: "字幕", subtitleWarning: "字幕时间轴到 06:40，视频长 04:33，字幕时间可能对不上。" }), ["字幕时间轴到 06:40，视频长 04:33，字幕时间可能对不上"]);
@@ -395,6 +421,8 @@ process.on("exit", (code) => {
   assert.strictEqual((await probe(reply(403, null))).error, E.obsidianKey);
   assert.strictEqual((await probe(reply(200, { authenticated: false }))).error, E.obsidianKey);
   assert.strictEqual((await probe(reply(500, null))).error, "Obsidian 返回 HTTP 500");
+  // The same 404 as a note's write and the pre-run check: a wrong address, with 去设置's code.
+  assert.deepStrictEqual({ ...(await probe(reply(404, null))) }, { ok: false, error: E.obsidianNotFound, code: "OBSIDIAN" });
   const down = await probe(async () => { throw new TypeError("Failed to fetch"); });
   assert.ok(down.error.startsWith(E.obsidianDown) && /证书/.test(down.error), down.error);
   assert.deepStrictEqual({ ...(await probe(reply(200, { authenticated: true, service: "S" }))) }, { ok: true, service: "S" });

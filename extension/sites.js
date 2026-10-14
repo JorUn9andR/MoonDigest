@@ -226,6 +226,21 @@
     return BILI_GONE_CODES.has(code);
   }
 
+  // Every B站 read below goes through this, whoever's io it is (the video page's fetch-json proxy or page fetch, the
+  // background's triageBiliGetJson): HTTP 412 (risk control's HTML page, as status), a BILI_RISK_CODES answer, or an
+  // io that already said THROTTLED, all become one THROTTLED error in MdgErrors.TEXT.biliThrottled's words.
+  const biliThrottled = () => Object.assign(new Error(MdgErrors.TEXT.biliThrottled), { code: "THROTTLED" });
+  async function biliJson(io, url) {
+    let json;
+    try {
+      json = await io.fetchJson(url);
+    } catch (error) {
+      throw error?.status === 412 || error?.code === "THROTTLED" ? biliThrottled() : error;
+    }
+    if (BILI_RISK_CODES.has(json?.code)) throw biliThrottled();
+    return json;
+  }
+
   // Old av links (/video/av170001) still open without redirecting; the BV id is a fixed transform of the aid.
   function biliAvToBv(aid) {
     const table = "FcwAPNKTMug3GV5Lj7EJnHpWsx4tb8haYeviqBz6rkCy12mUSDQX9RdoZf";
@@ -364,11 +379,15 @@
       return `https://www.bilibili.com/video/${id}/${suffix}`;
     },
     async fetchMeta(ref, io) {
-      let payload = await io.fetchJson(`${BILI_API}/x/web-interface/view/detail?bvid=${encodeURIComponent(ref.id)}`).catch(() => null);
+      // view/detail failing falls back to view, unless B站 is limiting: then a second request only digs deeper.
+      let payload = await biliJson(io, `${BILI_API}/x/web-interface/view/detail?bvid=${encodeURIComponent(ref.id)}`).catch((error) => {
+        if (error.code === "THROTTLED") throw error;
+        return null;
+      });
       let view = payload?.code === 0 ? payload.data?.View : null;
       let tags = payload?.code === 0 ? payload.data?.Tags : [];
       if (!view) {
-        payload = await io.fetchJson(`${BILI_API}/x/web-interface/view?bvid=${encodeURIComponent(ref.id)}`);
+        payload = await biliJson(io, `${BILI_API}/x/web-interface/view?bvid=${encodeURIComponent(ref.id)}`);
         if (payload?.code !== 0) {
           throw biliApiError(payload, "无法获取视频信息");
         }
@@ -431,11 +450,13 @@
       requests.push(`${BILI_API}/x/player/v2?bvid=${bvid}&cid=${cid}${meta?.aid ? `&aid=${aid}` : ""}`);
 
       const load = async (url) => {
-        const payload = await io.fetchJson(url);
+        const payload = await biliJson(io, url);
         if (payload?.code !== 0) {
           throw biliApiError(payload, "无法获取字幕列表");
         }
-        const data = payload.data || {};
+        // A player answer without a subtitle object is risk control too (a logged-out one still has it, empty).
+        if (!payload.data?.subtitle) throw biliThrottled();
+        const data = payload.data;
         const tracks = (data.subtitle?.subtitles || [])
           .map((item) => {
             const lang = String(item?.lan || "");
@@ -478,7 +499,7 @@
     // Raw responses are what the subtitle cache stores; parseSegments runs on
     // every read so a parser fix reaches cached entries.
     async fetchRaw(track, io) {
-      return io.fetchJson(track.url);
+      return biliJson(io, track.url);
     },
     parseSegments(raw) {
       return normalizeSegments(raw?.body);
@@ -488,7 +509,7 @@
       if (!aid || !count) {
         return [];
       }
-      const payload = await io.fetchJson(`${BILI_API}/x/v2/reply/main?type=1&oid=${aid}&mode=3&ps=${count}&pn=1`);
+      const payload = await biliJson(io, `${BILI_API}/x/v2/reply/main?type=1&oid=${aid}&mode=3&ps=${count}&pn=1`);
       const replies = Array.isArray(payload?.data?.replies) ? payload.data.replies : [];
       return replies.slice(0, count).map((item) => ({
         uname: String(item?.member?.uname || "匿名").trim() || "匿名",
@@ -1347,14 +1368,15 @@
   //   4. Still nothing matching: the first mismatched body, used with its check in `mismatch` (the reader shows
   //      MdgNote.subtitleMismatchWarning; it is never cached).
   // A limit with nothing usable throws, so the caller waits and tries again. Any other failure (network, timeout,
-  // expired link, empty files) leaves no subtitle with `error` and `failure`, its reason without the full stop, which
-  // every reader shows as 字幕抓取失败：原因. step(promise) wraps every wait (it sees settled results, never a rejection):
+  // expired link, empty files) leaves no subtitle with `error` and `failure`, its reason without the full stop; B站's
+  // logged-out answer leaves `needLogin`. Every reader says it with MdgErrors.subtitleMissing. step(promise) wraps every wait (it sees settled results, never a rejection):
   // the video page's run guard throws there once the video has changed.
   async function loadSubtitle(site, ref, meta, io, { prefer = {}, step = noStep } = {}) {
     const ids = { videoId: ref.id, cid: meta.cid };
-    const list = async (extra = {}) => {
+    // A limit throws unless a mismatched subtitle is already in hand (kept): that one is used, with its warning.
+    const list = async (extra = {}, kept = null) => {
       const got = await step(settle(site.fetchTracks(ref, meta, { ...io, ...extra })));
-      if (got.error && isLimit(got.error)) throw got.error;
+      if (got.error && isLimit(got.error) && !kept) throw got.error;
       return got;
     };
     const ranked = (bundle) => {
@@ -1368,8 +1390,10 @@
     let tracks = ranked(bundle);
     let pass = await loadFirstTrack(site, tracks, ids, io, meta.duration, step);
     if (tracks.length && (!pass.track || pass.mismatch) && !pass.limited) {
-      const again = await list(pass.empty ? { withoutPot: true } : {});
-      if (again.value?.tracks?.length) {
+      const again = await list(pass.empty ? { withoutPot: true } : {}, pass.track);
+      if (again.error && isLimit(again.error)) {
+        pass = { ...pass, error: again.error, limited: true };
+      } else if (again.value?.tracks?.length) {
         bundle = again.value;
         tracks = ranked(bundle);
         const next = await loadFirstTrack(site, tracks, ids, io, meta.duration, step);
@@ -1387,10 +1411,15 @@
         else if (!pass.track && body.length) pass = { ...pass, track, body, mismatch: result };
       }
     }
-    if (pass.track) return { track: pass.track, body: pass.body, mismatch: pass.mismatch, bundle, tracks, error: null, failure: "" };
+    if (pass.track) return { track: pass.track, body: pass.body, mismatch: pass.mismatch, bundle, tracks, error: null, failure: "", needLogin: false };
     if (pass.limited) throw pass.error;
     const why = pass.error || got.error || (!tracks.length && meta.gate ? new Error(meta.gate) : null);
-    return { track: null, body: [], mismatch: null, bundle, tracks, error: why, failure: why ? String(why.message || why).replace(/[。.！!；;，,\s]+$/u, "") : "" };
+    // needLogin: B站 listed nothing because it saw a logged-out viewer, a state of its own (MdgErrors.subtitleMissing).
+    return {
+      track: null, body: [], mismatch: null, bundle, tracks, error: why,
+      failure: why ? String(why.message || why).replace(/[。.！!；;，,\s]+$/u, "") : "",
+      needLogin: !why && bundle.needLogin === true
+    };
   }
 
   // ----------------------------------------------------------------- registry

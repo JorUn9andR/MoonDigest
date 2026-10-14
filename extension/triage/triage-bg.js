@@ -252,8 +252,10 @@ async function triageBiliJson(res) {
 }
 
 // -101 (and a missing bili_jct or nav's isLogin) is NOT_LOGGED_IN, which the page answers with its 去登录 banner.
+// follow-bg.js maps its -101 with it too.
+const triageNotLoggedIn = () => triageError(MdgErrors.TEXT.biliLogin, "NOT_LOGGED_IN");
 function triageBiliData(json) {
-  if (json.code === -101) throw triageError("未登录 B站", "NOT_LOGGED_IN");
+  if (json.code === -101) throw triageNotLoggedIn();
   if (json.code !== 0) throw triageError(`B站返回 ${json.code}：${json.message}`, BILI_RISK_CODES.has(json.code) ? "THROTTLED" : undefined);
   return json.data;
 }
@@ -304,7 +306,7 @@ async function triageBiliGetJson(url, pace) {
       if (e.code !== "THROTTLED") throw e;
     }
     if (json && !(pace && BILI_RISK_CODES.has(json.code))) return json;
-    if (strike >= pace.cfg.strikes) throw triageError("被 B站 限流，已暂停", "THROTTLED");
+    if (strike >= pace.cfg.strikes) throw triageError(MdgErrors.TEXT.biliThrottled, "THROTTLED");
     if (typeof url === "function") MdgSites.biliWbiReset();
     pace.hold(pace.cfg.backoffMs, "throttled");
   }
@@ -316,7 +318,7 @@ async function triageBiliGet(url) {
 
 async function triageBiliPost(path, fields) {
   const cookie = await chrome.cookies.get({ url: "https://www.bilibili.com", name: "bili_jct" });
-  if (!cookie?.value) throw triageError("未登录 B站", "NOT_LOGGED_IN");
+  if (!cookie?.value) throw triageNotLoggedIn();
   // A write is tried once. Without an answer B站 may or may not have done it, so callers keep their state as before
   // (no count change, no undo step) and the message says to look.
   const res = await triageBiliFetch(`https://api.bilibili.com${path}`, {
@@ -329,17 +331,9 @@ async function triageBiliPost(path, fields) {
   return triageBiliData(await triageBiliJson(res));
 }
 
-// The sites.js fetchers (细看, notes) through the same channel, one try, with risk control mapped to THROTTLED like
-// triageBiliGet. A player answer without a subtitle object is risk control too.
-const TRIAGE_BILI_IO = {
-  signWbi: true,
-  async fetchJson(url) {
-    const json = await triageBiliGetJson(url);
-    if (BILI_RISK_CODES.has(json?.code)) throw triageError(`B站返回 ${json.code}：${json.message}`, "THROTTLED");
-    if (json?.code === 0 && /\/x\/player\//.test(url) && !json.data?.subtitle) throw triageError("B站字幕接口限流，稍后重试", "THROTTLED");
-    return json;
-  }
-};
+// The sites.js fetchers (细看, notes, the side panel follow-up) through the same channel, one try. sites.js's B站
+// reads turn risk control into THROTTLED themselves, as for the video page.
+const TRIAGE_BILI_IO = { signWbi: true, fetchJson: (url) => triageBiliGetJson(url) };
 
 // nav 未登录时 code=-101，triageBiliGet 会当错误抛出，所以只查 HTTP 与 JSON，由 triageMid 判断登录
 async function triageNav() {
@@ -348,7 +342,7 @@ async function triageNav() {
 
 async function triageMid() {
   const nav = await triageNav();
-  if (!nav.isLogin || !nav.mid) throw triageError("未登录 B站", "NOT_LOGGED_IN");
+  if (!nav.isLogin || !nav.mid) throw triageNotLoggedIn();
   return nav.mid;
 }
 
@@ -573,7 +567,7 @@ async function triageAnalyze({ bvid, force, criteria, folder, aiProviderId }) {
     status: "done",
     source,
     // Bilibili hides subtitles from a logged-out user; the card says so.
-    ...(source === "meta" && got.bundle.needLogin ? { needLogin: true } : {}),
+    ...(got.needLogin ? { needLogin: true } : {}),
     ...(got.failure ? { subtitleFailure: got.failure } : {}),
     ...(got.mismatch ? { subtitleWarning: MdgNote.subtitleMismatchWarning(got.mismatch) } : {}),
     ...triageParseLlm(content),
@@ -604,6 +598,16 @@ function triageAiHttpError(status, detail = "") {
 }
 const AI_NETWORK_TEXT = "连不上 AI 平台，请检查网络和接口地址";
 
+// Some platforms report quota, rate and moderation failures inside an HTTP 200 body (a stream chunk for the side panel's
+// parseOpenAISSE, the whole reply for triageChat). A quota or rate message is classified as an HTTP 429 (a per-minute
+// quota is 限流, not 余额不足); otherwise only a Chinese message is shown. null when the body carries no error.
+function triageAiBodyError(json) {
+  if (!json?.error) return null;
+  const detail = typeof json.error === "string" ? json.error : json.error.message || JSON.stringify(json.error);
+  if (AI_QUOTA_RE.test(detail) || AI_RATE_RE.test(detail)) return triageAiHttpError(429, detail);
+  return triageError(/[\u4e00-\u9fff]/.test(detail) ? `AI 平台返回错误：${detail}` : "AI 平台返回错误");
+}
+
 // 单次 AI 请求的超时（毫秒）。思考模式慢得多；两档都要短于 MV3 单个消息事件约 5 分钟的上限
 const TRIAGE_AI_TIMEOUT_MS = { normal: 120000, thinking: 240000 };
 
@@ -629,7 +633,7 @@ async function triageChat(messages, maxTokens, thinking = false, providerId = ""
   const timeout = new Promise((_, reject) => {
     timer = setTimeout(() => {
       controller.abort();
-      reject(triageError(`AI 平台 ${ms / 1000} 秒没有回应`, "AI_TIMEOUT"));
+      reject(triageError(MdgErrors.aiTimeout(ms), "AI_TIMEOUT"));
     }, ms);
   });
   const request = async () => {
@@ -643,7 +647,12 @@ async function triageChat(messages, maxTokens, thinking = false, providerId = ""
       throw denied ? triageError(denied) : triageError(AI_NETWORK_TEXT, "AI_NETWORK");
     });
     if (!res.ok) throw triageAiHttpError(res.status, await res.text().catch(() => ""));
-    const json = await res.json();
+    // A body that is not JSON is this request's failure, in Chinese (not JSON.parse's SyntaxError).
+    const json = await res.json().catch(() => {
+      throw triageError("AI 平台的回复不是 JSON");
+    });
+    const bodyError = triageAiBodyError(json);
+    if (bodyError) throw bodyError;
     const choice = json.choices?.[0];
     if (!choice?.message?.content && choice?.finish_reason === "length") {
       throw triageError("模型输出被截断");
@@ -718,10 +727,13 @@ async function triageBuildNote(bvid, settings) {
   const found = await MdgSites.loadSubtitle(site, ref, meta, io);
   const { track, body, bundle } = found;
   const subtitleFailure = found.failure;
-  const subtitleWarning = found.mismatch ? MdgNote.subtitleMismatchWarning(found.mismatch) : subtitleFailure ? `字幕抓取失败：${subtitleFailure}。` : "";
+  const subtitleNeedLogin = found.needLogin;
+  const subtitleWarning = found.mismatch
+    ? MdgNote.subtitleMismatchWarning(found.mismatch)
+    : subtitleFailure || subtitleNeedLogin ? `${MdgErrors.subtitleMissing({ subtitleFailure, subtitleNeedLogin })}。` : "";
   const hotComments =
     settings.includeHotCommentsInNote || !body.length ? await site.fetchComments(ref, meta, io).catch(() => []) : [];
-  const noteMeta = { ...MdgNote.noteMetaOf({ site: "bilibili", videoId: bvid, meta, bundle, track }), hotComments, subtitleFailure };
+  const noteMeta = { ...MdgNote.noteMetaOf({ site: "bilibili", videoId: bvid, meta, bundle, track }), hotComments, subtitleFailure, subtitleNeedLogin };
   const { aiConversations } = MdgLimits.KEYS;
   // 分拣台 notes always summarize the video's P1 (the analysis is per bvid).
   const extrasRef = { site: "bilibili", videoId: bvid, pageIndex: 1 };
@@ -739,16 +751,10 @@ async function triageBuildNote(bvid, settings) {
   return { meta, noteMeta, body, markdown, filename, path, cover, subtitleWarning };
 }
 
-// Before a 逐个视频笔记 run: the settings and one request to the API root (it answers authenticated: false to a wrong key).
-// A 404 there is a wrong address (去设置); any other HTTP error is Obsidian's own, which the settings page cannot fix.
+// Before a 逐个视频笔记 run: the settings and the settings page's 测试连接 request (obsidian.js probeObsidian).
 async function triageObsidianCheck() {
   const { baseUrl, apiKey } = obsidianConfig(await getMergedSettings());
-  const res = await fetchWithTimeout(`${baseUrl.replace(/\/+$/, "")}/`, { headers: { Authorization: `Bearer ${apiKey}` }, cache: "no-store" }, OBSIDIAN_TIMEOUT_MS).catch((e) => {
-    throw obsidianError(e);
-  });
-  const data = await res.json().catch(() => null);
-  if (data?.authenticated === false || res.status === 401 || res.status === 403) throw obsidianError({ status: 401 });
-  if (!res.ok) throw triageError(`Obsidian 返回 HTTP ${res.status}`, res.status === 404 ? "OBSIDIAN" : "");
+  await probeObsidian(baseUrl, apiKey);
 }
 
 // 逐个视频笔记: obsidian.js writeVideoNote without a conversation, so it never asks. overwrite rewrites the note; without

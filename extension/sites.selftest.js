@@ -17,8 +17,8 @@ const chrome = {
   }
 };
 const ctx = vm.createContext({ URL, URLSearchParams, TextEncoder, console, chrome });
-// Manifest order: limits.js before sites.js.
-for (const file of ["limits.js", "sites.js"]) vm.runInContext(fs.readFileSync(path.join(__dirname, file), "utf8"), ctx);
+// Manifest order: limits.js and errors.js before sites.js.
+for (const file of ["limits.js", "errors.js", "sites.js"]) vm.runInContext(fs.readFileSync(path.join(__dirname, file), "utf8"), ctx);
 const S = ctx.MdgSites;
 // vm objects have a foreign Object prototype, so compare by value.
 const eq = (actual, expected) => assert.deepStrictEqual(JSON.parse(JSON.stringify(actual)), expected);
@@ -526,6 +526,18 @@ async function ytComments(next, byContinuation) {
   // A logged-out answer is reported, not mistaken for a video without subtitles.
   const loggedOut = { fetchJson: async () => ({ code: 0, data: { need_login_subtitle: true, subtitle: { subtitles: [] } } }) };
   eq((await S.SITES.bilibili.fetchTracks(biliRef, biliMeta, loggedOut)).needLogin, true);
+  // B站 risk control, whichever io it comes through (HTTP 412 as status, a risk code, a player answer without a subtitle
+  // object): THROTTLED in the one sentence, and no fallback request to player/v2 or view.
+  for (const answer of [Object.assign(new Error("HTTP 412"), { status: 412 }), { code: -352, message: "风控校验失败" }, { code: 0, data: {} }]) {
+    const urls = [];
+    const io = { fetchJson: async (url) => (urls.push(url), answer instanceof Error ? Promise.reject(answer) : answer) };
+    await assert.rejects(S.SITES.bilibili.fetchTracks(biliRef, biliMeta, io), (e) => e.code === "THROTTLED" && e.message === "B站限流，请稍后再试", JSON.stringify(answer));
+    eq(urls.map((u) => new URL(u).pathname), ["/x/player/wbi/v2"]);
+    if (answer.code === 0) continue;
+    urls.length = 0;
+    await assert.rejects(S.SITES.bilibili.fetchMeta(biliRef, io), (e) => e.code === "THROTTLED");
+    eq(urls.map((u) => new URL(u).pathname), ["/x/web-interface/view/detail"]);
+  }
 
   // Subtitle cache: same key format content.js always wrote; entries hold the raw response.
   const cache = S.subtitleCache;
@@ -614,6 +626,21 @@ async function ytComments(next, byContinuation) {
   eq(f.calls, ["list", "a"]);
   f = fake(Object.assign(new Error("风控"), { code: "THROTTLED" }), {});
   await assert.rejects(load(f), (e) => e.code === "THROTTLED");
+  // The second list read limited: the mismatched subtitle already in hand is used with its warning.
+  {
+    let lists = 0;
+    f = fake(two, { a: tooLong, b: tooLong }, {
+      fetchTracks: async () => (++lists === 1 ? { tracks: two } : Promise.reject(Object.assign(new Error("风控"), { code: "THROTTLED" })))
+    });
+    got = await load(f);
+    eq([got.track.id, got.mismatch.reason, lists], ["a", "too-long", 2]);
+    // Nothing usable in hand: the limit throws.
+    lists = 0;
+    f = fake(two, { a: new Error("请求失败：404"), b: new Error("请求失败：404") }, {
+      fetchTracks: async () => (++lists === 1 ? { tracks: two } : Promise.reject(Object.assign(new Error("风控"), { code: "THROTTLED" })))
+    });
+    await assert.rejects(load(f), (e) => e.code === "THROTTLED");
+  }
 
   // Empty bodies (YouTube's answer to a rejected PO token), even next to another failure: the second list goes without
   // the token, and nothing usable is a failure with its reason.
@@ -624,6 +651,10 @@ async function ytComments(next, byContinuation) {
   eq((await load(fake(new Error("网络断了。"), {}))).failure, "网络断了");
   got = await load(fake([], {}));
   eq([got.track, got.failure], [null, ""]);
+  // B站's logged-out answer is its own state, not a failure.
+  got = await load(fake([], {}, { fetchTracks: async () => ({ tracks: [], needLogin: true }) }));
+  eq([got.track, got.failure, got.needLogin], [null, "", true]);
+  eq((await load(fake(two, { a: fit }))).needLogin, false);
 
   // YouTube's transcript, when the tracks are limited or all fail, or the video is gated; a failed transcript leaves
   // the gate as the reason.

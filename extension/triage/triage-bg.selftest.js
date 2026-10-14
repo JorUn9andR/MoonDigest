@@ -22,6 +22,9 @@ const plain = (x) => JSON.parse(JSON.stringify(x));
 assert.strictEqual(t.obsidianError(vm.runInContext('new TypeError("Failed to fetch")', ctx)).code, "OBSIDIAN_DOWN");
 assert.strictEqual(t.obsidianError({ status: 408 }).code, "OBSIDIAN_DOWN");
 assert.strictEqual(t.obsidianError({ status: 401 }).code, "OBSIDIAN");
+// 404 is one thing on every path (a note's write, 一篇摘录, 测试连接, the pre-run check): a wrong address, 去设置.
+assert.deepStrictEqual([t.obsidianError({ status: 404 }).code, t.obsidianError({ status: 404 }).message], ["OBSIDIAN", t.MdgErrors.TEXT.obsidianNotFound]);
+assert.throws(() => t.obsidianConfig({ obsidianEnabled: false }), (e) => e.code === "OBSIDIAN" && e.message === t.MdgErrors.TEXT.obsidianOff);
 // An HTTP failure of one note shows the status, never the response body.
 assert.strictEqual(t.obsidianError({ status: 500, message: 'HTTP 500. {"errorCode":50000}' }).message, "Obsidian 返回 HTTP 500");
 const noteErr = new Error("生成笔记失败");
@@ -256,6 +259,15 @@ assert.throws(() => t.triageParseCommand('{"new_tags":[', cmdItems, cmdTags, {})
   }
   t.loadAiProviders = async () => [{ id: "p", baseUrl: "https://ai.test", model: "m" }];
 
+  // An error inside an HTTP 200 reply is recognized as in the side panel's stream; a reply that is not JSON fails this
+  // request in Chinese, not with JSON.parse's SyntaxError.
+  t.fetch = async () => ({ ok: true, json: async () => ({ error: { message: "You exceeded your current quota" } }) });
+  await assert.rejects(t.triageChat([], 100), (e) => e.code === "AI_QUOTA");
+  t.fetch = async () => ({ ok: true, json: async () => ({ error: { message: "Rate limit reached" } }) });
+  await assert.rejects(t.triageChat([], 100), (e) => e.code === "AI_THROTTLED");
+  t.fetch = async () => ({ ok: true, json: async () => JSON.parse("<html>") });
+  await assert.rejects(t.triageChat([], 100), (e) => e.code === undefined && e.message === "AI 平台的回复不是 JSON");
+
   // A request that never settles, even on abort, still ends with the retryable timeout code.
   vm.runInContext("TRIAGE_AI_TIMEOUT_MS.normal = 30; TRIAGE_AI_TIMEOUT_MS.thinking = 60;", ctx);
   let aborted = false;
@@ -314,7 +326,7 @@ assert.throws(() => t.triageParseCommand('{"new_tags":[', cmdItems, cmdTags, {})
   await assert.rejects(t.triageBiliPost("/x", {}), (e) => e.code === "THROTTLED");
   // N5: a write after the login expired is NOT_LOGGED_IN (the page shows 去登录), with a plain message.
   t.fetch = jsonRes({ code: -101, message: "账号未登录" });
-  await assert.rejects(t.triageBiliPost("/x", {}), (e) => e.code === "NOT_LOGGED_IN" && e.message === "未登录 B站");
+  await assert.rejects(t.triageBiliPost("/x", {}), (e) => e.code === "NOT_LOGGED_IN" && e.message === t.MdgErrors.TEXT.biliLogin);
   t.fetch = jsonRes({ code: 11010, message: "内容不存在" });
   await assert.rejects(t.triageBiliPost("/x", {}), (e) => e.code === undefined);
   t.fetch = async () => ({ ok: true, status: 200, json: async () => JSON.parse("<html>") });
@@ -521,9 +533,14 @@ assert.throws(() => t.triageParseCommand('{"new_tags":[', cmdItems, cmdTags, {})
   routes = { ...baseRoutes(), [subUrl]: Object.assign(new Error("HTTP 403"), { status: 403 }) };
   const noSub = await buildNote();
   assert.deepStrictEqual([noSub.body.length, noSub.subtitleWarning], [0, "字幕抓取失败：B站请求失败 HTTP 403。"]);
-  assert.ok(noSub.markdown.includes("> 字幕抓取失败（B站请求失败 HTTP 403），以下为简介与热门评论。"), noSub.markdown);
+  assert.ok(noSub.markdown.includes("> 字幕抓取失败：B站请求失败 HTTP 403，以下为简介与热门评论。"), noSub.markdown);
   routes = listDown();
   assert.deepStrictEqual([(await buildNote()).body.length, (await buildNote()).subtitleWarning], [0, "字幕抓取失败：网络断了。"]);
+  // Not logged in: its own sentence on the result list and in the note, which says no more than that.
+  routes = { ...baseRoutes(), "/x/player/wbi/v2": { code: 0, data: { subtitle: { subtitles: [] }, need_login_subtitle: true } } };
+  const loggedOut = await buildNote();
+  assert.strictEqual(loggedOut.subtitleWarning, "未登录 B站，拿不到字幕。");
+  assert.ok(loggedOut.markdown.includes("> 未登录 B站，拿不到字幕，以下为简介与热门评论。") && !/请登录|刷新网页/.test(loggedOut.markdown), loggedOut.markdown);
   // A subtitle that does not match the video's length is kept with the video page's warning, and is not cached.
   routes = { ...baseRoutes(), [subUrl]: subtitleRaw(400) };
   const keptNote = await buildNote();

@@ -288,7 +288,7 @@ const el = {};
 function send(msg) {
   return sendRaw(msg).then((r) => (MdgErrors.action(r.code) === "login" && showLogin(), r));
 }
-const showLogin = () => showBanner("没登录 B站：先在这个浏览器里登录 B站", "去登录", () => openTab("https://passport.bilibili.com/login"), "login");
+const showLogin = () => showBanner(MdgErrors.TEXT.biliLogin, "去登录", () => openTab("https://passport.bilibili.com/login"), "login");
 // The AI platform picked at the top of the side panel: sidepanel.js keeps it in this extension's localStorage under
 // this key (SELECTED_PROVIDER_KEY there). Every request carries it; the background's AI calls use it (triageChat).
 const AI_PROVIDER_KEY = "mdg_ai_selected_provider";
@@ -2172,8 +2172,7 @@ const DONE_TIP = `已保留：${KEEP_TIP}。\n已取消收藏：已从 B站收�
 // whose time range may not match the video. Nothing for a matching subtitle.
 function basisText(a) {
   if (a.source !== "meta") return a.subtitleWarning ? esc(a.subtitleWarning.replace(/。$/, "")) : "";
-  if (a.needLogin) return "未登录 B站拿不到字幕，按简介和评论判断";
-  return a.subtitleFailure ? esc(`字幕抓取失败：${a.subtitleFailure}，按简介和评论判断`) : "没有字幕，按简介和评论判断";
+  return esc(`${MdgErrors.subtitleMissing({ subtitleNeedLogin: a.needLogin, subtitleFailure: a.subtitleFailure })}，按简介和评论判断`);
 }
 function cardHtml(it, expanded, mark) {
   const b = it.bvid;
@@ -2532,7 +2531,7 @@ const fav = {
     if (folders.length > 1) folders = await pickUnfavFolders(it);
     if (!folders.length) return;
     const r = await W.single("取消收藏", folders.map((f) => ({ msg: { type: "triage-unfav", mediaId: f, aids: [it.aid] }, keys: [bvid], folders: [f] })), ({ folders: [f] }) => bumpCount(f, -1));
-    if (r.error) toast(`取消收藏失败：${r.limited ? `${THROTTLES.THROTTLED.label}，请稍后再试` : r.error}`, true);
+    if (r.error) toast(`取消收藏失败：${r.limited ? MdgErrors.TEXT.biliThrottled : r.error}`, true);
     folders = folders.slice(0, r.done);
     if (!folders.length) return render();
     const rec = unfavRecord(it, Date.now());
